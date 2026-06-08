@@ -1,0 +1,33 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>{% block title %}{{ site_config.site.title }}{% endblock %}</title>
+    <link rel="stylesheet" href="/static/style.css">
+    <style>
+        :root {
+            --primary: {{ site_config.theme.primary_color | default('#2563eb') }};
+        }
+    </style>
+</head>
+<body class="{% if site_config.theme.dark_mode %}dark{% endif %}">
+    <header>
+        <nav>
+            <a href="/" class="logo">{{ site_config.site.title }}</a>
+            <div class="nav-links">
+                <a href="/">数据库</a>
+                <a href="/sql">SQL 编辑器</a>
+                <a href="/health">健康状态</a>
+            </div>
+        </nav>
+    </header>
+    <main>
+        {% block content %}{% endblock %}
+    </main>
+    <footer>
+        <p>{{ site_config.site.copyright | default('© 2024 DataPortal') }}</p>
+    </footer>
+    {% block scripts %}{% endblock %}
+</body>
+</html>

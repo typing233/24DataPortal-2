@@ -1,0 +1,103 @@
+{% extends "base.html" %}
+{% block title %}{{ site_config.site.title }} - 首页{% endblock %}
+{% block content %}
+<div class="container">
+    <section class="hero">
+        <h1>{{ site_config.site.title }}</h1>
+        <p>{{ site_config.site.description | default('交互式数据探索门户') }}</p>
+    </section>
+
+    <section class="health-panel">
+        <h2>系统状态</h2>
+        <div class="stats-grid">
+            <div class="stat-card">
+                <span class="stat-value">{{ health.databases }}</span>
+                <span class="stat-label">数据库</span>
+            </div>
+            <div class="stat-card">
+                <span class="stat-value">{{ health.total_tables }}</span>
+                <span class="stat-label">数据表</span>
+            </div>
+            <div class="stat-card">
+                <span class="stat-value">{{ health.total_views }}</span>
+                <span class="stat-label">视图</span>
+            </div>
+            <div class="stat-card {{ 'healthy' if health.status == 'healthy' else 'unhealthy' }}">
+                <span class="stat-value">{{ health.status }}</span>
+                <span class="stat-label">健康状态</span>
+            </div>
+        </div>
+    </section>
+
+    <section class="databases">
+        <h2>数据源</h2>
+        {% for db in databases %}
+        <div class="db-card">
+            <div class="db-header">
+                <h3>{{ db.name }}</h3>
+                <span class="badge">{{ db.source_type }}</span>
+                <span class="size">{{ (db.size_bytes / 1024 / 1024) | round(2) }} MB</span>
+            </div>
+            <div class="tables-list">
+                <h4>表 ({{ db.tables | length }})</h4>
+                <table class="meta-table">
+                    <thead>
+                        <tr><th>名称</th><th>行数</th><th>列数</th><th>索引</th><th>操作</th></tr>
+                    </thead>
+                    <tbody>
+                    {% for t in db.tables %}
+                        <tr>
+                            <td>{{ t.name }}</td>
+                            <td>{{ "{:,}".format(t.row_count) }}</td>
+                            <td>{{ t.columns | length }}</td>
+                            <td>{{ t.indexes | length }}</td>
+                            <td>
+                                <a href="/db/{{ db.name }}/table/{{ t.name }}" class="btn btn-sm">浏览</a>
+                                <a href="/sql/{{ db.name }}" class="btn btn-sm btn-secondary">查询</a>
+                            </td>
+                        </tr>
+                    {% endfor %}
+                    </tbody>
+                </table>
+            </div>
+            {% if db.views %}
+            <div class="views-list">
+                <h4>视图 ({{ db.views | length }})</h4>
+                <table class="meta-table">
+                    <thead><tr><th>名称</th><th>行数</th><th>操作</th></tr></thead>
+                    <tbody>
+                    {% for v in db.views %}
+                        <tr>
+                            <td>{{ v.name }}</td>
+                            <td>{{ "{:,}".format(v.row_count) }}</td>
+                            <td><a href="/db/{{ db.name }}/table/{{ v.name }}" class="btn btn-sm">浏览</a></td>
+                        </tr>
+                    {% endfor %}
+                    </tbody>
+                </table>
+            </div>
+            {% endif %}
+        </div>
+        {% endfor %}
+    </section>
+
+    {% if imports %}
+    <section class="imports">
+        <h2>导入状态</h2>
+        <table class="meta-table">
+            <thead><tr><th>文件</th><th>状态</th><th>进度</th><th>行数</th></tr></thead>
+            <tbody>
+            {% for path, imp in imports.items() %}
+                <tr>
+                    <td>{{ path.split('/')[-1] }}</td>
+                    <td><span class="badge badge-{{ imp.status }}">{{ imp.status }}</span></td>
+                    <td>{{ (imp.progress * 100) | round(1) }}%</td>
+                    <td>{{ "{:,}".format(imp.rows) }}</td>
+                </tr>
+            {% endfor %}
+            </tbody>
+        </table>
+    </section>
+    {% endif %}
+</div>
+{% endblock %}

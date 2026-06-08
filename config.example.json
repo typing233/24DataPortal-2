@@ -1,0 +1,31 @@
+{
+    "site": {
+        "title": "我的数据门户",
+        "copyright": "© 2024 MyCompany",
+        "description": "公司内部数据探索平台"
+    },
+    "theme": {
+        "primary_color": "#7c3aed",
+        "dark_mode": false
+    },
+    "permissions": {
+        "allow_sql_write": false,
+        "allow_sql_ddl": false,
+        "max_query_time_seconds": 30,
+        "max_rows_return": 10000,
+        "allowed_functions": [],
+        "blocked_tables": ["_dataportal_imports"]
+    },
+    "import": {
+        "strategy": "incremental",
+        "chunk_size": 5000,
+        "encoding_detection": true,
+        "create_indexes": true,
+        "max_file_size_mb": 500
+    },
+    "cache": {
+        "enabled": true,
+        "ttl_seconds": 60,
+        "max_entries": 1000
+    }
+}

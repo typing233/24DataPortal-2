@@ -1,0 +1,129 @@
+{% extends "base.html" %}
+{% block title %}{{ site_config.site.title }} - {{ database }}/{{ table }}{% endblock %}
+{% block content %}
+<div class="container">
+    <nav class="breadcrumb">
+        <a href="/">首页</a> / <a href="/">{{ database }}</a> / <span>{{ table }}</span>
+    </nav>
+
+    <div class="browse-header">
+        <h1>{{ table }}</h1>
+        <div class="table-meta">
+            <span class="badge">{{ source }}</span>
+            <span>{{ "{:,}".format(pagination.total_rows) }} 行</span>
+            <span>{{ columns | length }} 列</span>
+            <span>{{ indexes | length }} 索引</span>
+        </div>
+    </div>
+
+    <div class="toolbar">
+        <form method="get" class="filter-form">
+            <div class="filter-group">
+                <label>搜索全文:</label>
+                <input type="text" name="search" value="{{ search }}" placeholder="关键词...">
+            </div>
+            <div class="filter-group">
+                <label>列过滤:</label>
+                <select name="filter_col">
+                    <option value="">选择列</option>
+                    {% for col in columns %}
+                    <option value="{{ col.name }}" {{ 'selected' if filter_col == col.name else '' }}>{{ col.name }}</option>
+                    {% endfor %}
+                </select>
+                <input type="text" name="filter_val" value="{{ filter_val }}" placeholder="值...">
+            </div>
+            <div class="filter-group">
+                <label>排序:</label>
+                <input type="text" name="sort" value="{{ sort }}" placeholder="col1,-col2">
+            </div>
+            <div class="filter-group">
+                <label>每页:</label>
+                <select name="per_page">
+                    {% for n in [25, 50, 100, 200] %}
+                    <option value="{{ n }}" {{ 'selected' if pagination.per_page == n else '' }}>{{ n }}</option>
+                    {% endfor %}
+                </select>
+            </div>
+            <button type="submit" class="btn">查询</button>
+            <button type="button" class="btn btn-secondary" onclick="saveView()">保存视图</button>
+        </form>
+    </div>
+
+    <div class="schema-info">
+        <details>
+            <summary>表结构 ({{ columns | length }} 列)</summary>
+            <table class="meta-table compact">
+                <thead><tr><th>列名</th><th>类型</th><th>主键</th></tr></thead>
+                <tbody>
+                {% for col in columns %}
+                    <tr>
+                        <td>{{ col.name }}</td>
+                        <td><code>{{ col.type }}</code></td>
+                        <td>{{ '✓' if col.pk else '' }}</td>
+                    </tr>
+                {% endfor %}
+                </tbody>
+            </table>
+        </details>
+    </div>
+
+    <div class="data-table-wrapper">
+        <table class="data-table">
+            <thead>
+                <tr>
+                    {% for col in columns %}
+                    <th>
+                        <a href="?sort={{ col.name if sort != col.name else '-' + col.name }}&page=1&per_page={{ pagination.per_page }}&search={{ search }}&filter_col={{ filter_col }}&filter_val={{ filter_val }}">
+                            {{ col.name }}
+                            {% if sort == col.name %}↑{% elif sort == '-' + col.name %}↓{% endif %}
+                        </a>
+                    </th>
+                    {% endfor %}
+                </tr>
+            </thead>
+            <tbody>
+                {% for row in rows %}
+                <tr>
+                    {% for cell in row %}
+                    <td>{{ cell if cell is not none else '<null>' }}</td>
+                    {% endfor %}
+                </tr>
+                {% endfor %}
+            </tbody>
+        </table>
+    </div>
+
+    <div class="pagination">
+        {% if pagination.has_prev %}
+        <a href="?page={{ pagination.page - 1 }}&per_page={{ pagination.per_page }}&sort={{ sort }}&search={{ search }}&filter_col={{ filter_col }}&filter_val={{ filter_val }}" class="btn">← 上一页</a>
+        {% endif %}
+        <span class="page-info">第 {{ pagination.page }} / {{ pagination.total_pages }} 页</span>
+        {% if pagination.has_next %}
+        <a href="?page={{ pagination.page + 1 }}&per_page={{ pagination.per_page }}&sort={{ sort }}&search={{ search }}&filter_col={{ filter_col }}&filter_val={{ filter_val }}" class="btn">下一页 →</a>
+        {% endif %}
+    </div>
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script>
+function saveView() {
+    const name = prompt('视图名称:');
+    if (!name) return;
+    const params = new URLSearchParams(window.location.search);
+    fetch('/views/save', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({
+            name: name,
+            database: '{{ database }}',
+            table: '{{ table }}',
+            sort: params.get('sort') || '',
+            filter_col: params.get('filter_col') || '',
+            filter_val: params.get('filter_val') || '',
+            search: params.get('search') || '',
+        })
+    }).then(r => r.json()).then(d => alert('视图已保存'));
+}
+</script>
+{% endblock %}

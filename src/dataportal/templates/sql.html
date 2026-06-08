@@ -1,0 +1,168 @@
+{% extends "base.html" %}
+{% block title %}{{ site_config.site.title }} - SQL 编辑器{% endblock %}
+{% block content %}
+<div class="container">
+    <h1>SQL 编辑器</h1>
+
+    <div class="sql-editor-panel">
+        <div class="editor-controls">
+            <select id="db-select">
+                {% for db in databases %}
+                <option value="{{ db }}" {{ 'selected' if db == database else '' }}>{{ db }}</option>
+                {% endfor %}
+            </select>
+            <button id="run-btn" class="btn" onclick="executeSQL()">▶ 执行 (Ctrl+Enter)</button>
+            <button class="btn btn-secondary" onclick="clearResults()">清空</button>
+            <span id="status" class="status"></span>
+        </div>
+
+        <textarea id="sql-input" rows="8" placeholder="输入 SQL 查询...&#10;&#10;示例:&#10;SELECT * FROM table_name LIMIT 100&#10;PRAGMA table_info('table_name')"></textarea>
+
+        <div id="error-panel" class="error-panel hidden">
+            <strong>错误:</strong> <span id="error-msg"></span>
+            <div id="error-explain" class="explain"></div>
+        </div>
+
+        <div id="results-panel" class="results-panel hidden">
+            <div class="results-meta">
+                <span id="result-info"></span>
+                <button class="btn btn-sm" onclick="exportCSV()">导出 CSV</button>
+            </div>
+            <div class="results-table-wrapper">
+                <table id="results-table" class="data-table">
+                    <thead id="results-head"></thead>
+                    <tbody id="results-body"></tbody>
+                </table>
+            </div>
+        </div>
+    </div>
+
+    <div class="history-panel">
+        <h3>查询历史</h3>
+        <div id="history-list">
+            {% for h in history %}
+            <div class="history-item" onclick="loadQuery('{{ h.sql | replace("'", "\\'") | replace('\n', ' ') }}')">
+                <code>{{ h.sql[:80] }}{{ '...' if h.sql|length > 80 else '' }}</code>
+                <small>{{ h.db }} | {{ h.rows_returned }} 行 | {{ "%.2f"|format(h.elapsed) }}s</small>
+            </div>
+            {% endfor %}
+        </div>
+    </div>
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script>
+const sqlInput = document.getElementById('sql-input');
+const dbSelect = document.getElementById('db-select');
+
+sqlInput.addEventListener('keydown', (e) => {
+    if (e.ctrlKey && e.key === 'Enter') {
+        e.preventDefault();
+        executeSQL();
+    }
+});
+
+let lastResult = null;
+
+async function executeSQL() {
+    const sql = sqlInput.value.trim();
+    if (!sql) return;
+
+    const db = dbSelect.value;
+    const status = document.getElementById('status');
+    const errorPanel = document.getElementById('error-panel');
+    const resultsPanel = document.getElementById('results-panel');
+
+    status.textContent = '执行中...';
+    errorPanel.classList.add('hidden');
+    resultsPanel.classList.add('hidden');
+
+    try {
+        const resp = await fetch('/sql/execute', {
+            method: 'POST',
+            headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({database: db, sql: sql})
+        });
+        const data = await resp.json();
+
+        if (data.error) {
+            errorPanel.classList.remove('hidden');
+            document.getElementById('error-msg').textContent = data.error;
+            document.getElementById('error-explain').textContent = data.explanation || '';
+            status.textContent = '错误';
+            return;
+        }
+
+        lastResult = data;
+        status.textContent = `${data.row_count} 行 | ${data.elapsed_seconds?.toFixed(3)}s`;
+
+        if (data.columns && data.columns.length > 0) {
+            resultsPanel.classList.remove('hidden');
+            document.getElementById('result-info').textContent =
+                `${data.row_count} 行, ${data.columns.length} 列, ${data.elapsed_seconds?.toFixed(3)}s`;
+
+            const thead = document.getElementById('results-head');
+            thead.innerHTML = '<tr>' + data.columns.map(c => `<th>${c}</th>`).join('') + '</tr>';
+
+            const tbody = document.getElementById('results-body');
+            tbody.innerHTML = data.rows.map(row =>
+                '<tr>' + row.map(cell => `<td>${cell === null ? '<em>NULL</em>' : escapeHtml(String(cell))}</td>`).join('') + '</tr>'
+            ).join('');
+        } else if (data.message) {
+            status.textContent = data.message;
+        }
+
+        addToHistory(db, sql, data);
+    } catch (e) {
+        status.textContent = '网络错误';
+        errorPanel.classList.remove('hidden');
+        document.getElementById('error-msg').textContent = e.message;
+    }
+}
+
+function escapeHtml(text) {
+    const div = document.createElement('div');
+    div.textContent = text;
+    return div.innerHTML;
+}
+
+function clearResults() {
+    document.getElementById('results-panel').classList.add('hidden');
+    document.getElementById('error-panel').classList.add('hidden');
+    document.getElementById('status').textContent = '';
+}
+
+function loadQuery(sql) {
+    sqlInput.value = sql;
+}
+
+function addToHistory(db, sql, data) {
+    const list = document.getElementById('history-list');
+    const item = document.createElement('div');
+    item.className = 'history-item';
+    item.onclick = () => loadQuery(sql);
+    item.innerHTML = `<code>${sql.slice(0, 80)}${sql.length > 80 ? '...' : ''}</code>
+        <small>${db} | ${data.row_count || 0} 行 | ${(data.elapsed_seconds || 0).toFixed(2)}s</small>`;
+    list.insertBefore(item, list.firstChild);
+}
+
+function exportCSV() {
+    if (!lastResult || !lastResult.columns) return;
+    let csv = lastResult.columns.join(',') + '\n';
+    for (const row of lastResult.rows) {
+        csv += row.map(c => {
+            const s = String(c === null ? '' : c);
+            return s.includes(',') || s.includes('"') || s.includes('\n')
+                ? '"' + s.replace(/"/g, '""') + '"' : s;
+        }).join(',') + '\n';
+    }
+    const blob = new Blob([csv], {type: 'text/csv'});
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = 'query_result.csv';
+    a.click();
+}
+</script>
+{% endblock %}
