@@ -71,10 +71,21 @@ async def startup():
         await _register_source(source)
 
 
+def _apply_config_changes():
+    """Apply config changes to sandbox, cache, and importer at runtime."""
+    sandbox.update_permissions(config.permissions)
+    cache_cfg = config.cache_config
+    cache._ttl = cache_cfg.get("ttl_seconds", 60)
+    cache._max_entries = cache_cfg.get("max_entries", 1000)
+    importer._config = config.import_config
+
+
 async def _register_source(source: str):
     path = Path(source).resolve()
     if path.is_dir():
         for f in sorted(path.iterdir()):
+            if f.name.startswith("."):
+                continue
             if f.suffix == ".sqlite" or f.suffix == ".db":
                 await registry.register(f.stem, str(f), "sqlite")
             elif f.suffix == ".csv":
@@ -101,7 +112,9 @@ async def shutdown():
 
 
 async def homepage(request: Request):
-    await config.check_reload()
+    reloaded = await config.check_reload()
+    if reloaded:
+        _apply_config_changes()
 
     dbs = []
     for name, info in registry.databases.items():
@@ -137,7 +150,9 @@ async def homepage(request: Request):
 
 
 async def browse_table(request: Request):
-    await config.check_reload()
+    reloaded = await config.check_reload()
+    if reloaded:
+        _apply_config_changes()
 
     db_name = request.path_params["db"]
     table_name = request.path_params["table"]
@@ -270,7 +285,9 @@ async def list_views(request: Request):
 
 
 async def sql_editor(request: Request):
-    await config.check_reload()
+    reloaded = await config.check_reload()
+    if reloaded:
+        _apply_config_changes()
 
     db_name = request.path_params.get("db", "")
     if db_name.endswith(".json"):
@@ -302,6 +319,7 @@ async def sql_execute(request: Request):
     if not sql:
         return JSONResponse({"error": "Empty query"}, status_code=400)
 
+    sandbox.update_permissions(config.permissions)
     validation = sandbox.validate(sql)
     if not validation["allowed"]:
         return JSONResponse(
@@ -320,6 +338,26 @@ async def sql_execute(request: Request):
 
     if result.get("error"):
         result["explanation"] = sandbox.explain_error(result["error"])
+
+    db_info = registry.databases[db_name]
+    result["metadata"] = {
+        "database": db_name,
+        "source_type": db_info.source_type,
+        "source_path": db_info.path,
+        "columns_detail": [
+            {"name": col, "index": i}
+            for i, col in enumerate(result.get("columns", []))
+        ],
+    }
+
+    if result.get("columns"):
+        conn = await registry.get_connection(db_name)
+        col_types = {}
+        for tbl in db_info.tables:
+            for c in tbl.get("columns", []):
+                col_types[c["name"]] = c["type"]
+        for entry in result["metadata"]["columns_detail"]:
+            entry["type"] = col_types.get(entry["name"], "UNKNOWN")
 
     return JSONResponse(result)
 

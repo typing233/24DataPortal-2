@@ -5,16 +5,15 @@
 ## 快速启动
 
 ```bash
-# 1. 安装
-pip install -e .
+pip install -e . && dataportal serve
+```
 
-# 2. 生成测试数据
-python tests/create_test_data.py
+安装后执行 `dataportal serve`，自动生成演示数据并在 http://localhost:8001 启动完整交互式网站。
 
-# 3. 一个命令启动
-dataportal serve tests/test_data/sample.sqlite tests/test_data/products.csv tests/test_data/sales_gbk.csv
+### 指定自己的数据
 
-# 打开浏览器: http://localhost:8001
+```bash
+dataportal serve mydata.sqlite sales.csv ./data_dir/ --port 9000
 ```
 
 ## 功能特性
