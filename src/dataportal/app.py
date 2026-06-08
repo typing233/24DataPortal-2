@@ -75,8 +75,12 @@ def _apply_config_changes():
     """Apply config changes to sandbox, cache, and importer at runtime."""
     sandbox.update_permissions(config.permissions)
     cache_cfg = config.cache_config
-    cache._ttl = cache_cfg.get("ttl_seconds", 60)
-    cache._max_entries = cache_cfg.get("max_entries", 1000)
+    new_ttl = cache_cfg.get("ttl_seconds", 60)
+    new_max = cache_cfg.get("max_entries", 1000)
+    if new_ttl != cache._ttl or new_max != cache._max_entries:
+        cache._ttl = new_ttl
+        cache._max_entries = new_max
+        cache.clear()
     importer._config = config.import_config
 
 
@@ -310,9 +314,17 @@ async def sql_editor(request: Request):
 
 
 async def sql_execute(request: Request):
-    body = await request.json()
-    db_name = body.get("database", "")
-    sql = body.get("sql", "").strip()
+    reloaded = await config.check_reload()
+    if reloaded:
+        _apply_config_changes()
+
+    if request.method == "GET":
+        db_name = request.query_params.get("database", "")
+        sql = request.query_params.get("sql", "").strip()
+    else:
+        body = await request.json()
+        db_name = body.get("database", "")
+        sql = body.get("sql", "").strip()
 
     if not db_name or db_name not in registry.databases:
         return JSONResponse({"error": "Invalid database"}, status_code=400)
@@ -340,24 +352,17 @@ async def sql_execute(request: Request):
         result["explanation"] = sandbox.explain_error(result["error"])
 
     db_info = registry.databases[db_name]
+    column_types = result.pop("column_types", [])
     result["metadata"] = {
         "database": db_name,
         "source_type": db_info.source_type,
         "source_path": db_info.path,
+        "query": sql,
         "columns_detail": [
-            {"name": col, "index": i}
+            {"name": col, "type": column_types[i] if i < len(column_types) else "UNKNOWN", "index": i}
             for i, col in enumerate(result.get("columns", []))
         ],
     }
-
-    if result.get("columns"):
-        conn = await registry.get_connection(db_name)
-        col_types = {}
-        for tbl in db_info.tables:
-            for c in tbl.get("columns", []):
-                col_types[c["name"]] = c["type"]
-        for entry in result["metadata"]["columns_detail"]:
-            entry["type"] = col_types.get(entry["name"], "UNKNOWN")
 
     return JSONResponse(result)
 
@@ -390,8 +395,10 @@ routes = [
     Route("/db/{db}/table/{table}", browse_table),
     Route("/db/{db}/views", list_views),
     Route("/views/save", save_view, methods=["POST"]),
-    Route("/sql/execute", sql_execute, methods=["POST"]),
+    Route("/sql/execute", sql_execute, methods=["GET", "POST"]),
+    Route("/sql/execute.json", sql_execute, methods=["GET", "POST"]),
     Route("/sql/history", sql_history),
+    Route("/sql/history.json", sql_history),
     Route("/sql", sql_editor),
     Route("/sql.json", sql_editor),
     Route("/sql/{db}", sql_editor),

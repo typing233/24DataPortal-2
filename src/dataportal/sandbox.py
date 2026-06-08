@@ -4,53 +4,82 @@ import time
 from typing import Any
 
 
-WRITE_KEYWORDS = {"INSERT", "UPDATE", "DELETE", "REPLACE"}
-DDL_KEYWORDS = {"CREATE", "DROP", "ALTER", "RENAME", "VACUUM", "REINDEX"}
-DANGEROUS_KEYWORDS = {"ATTACH", "DETACH", "LOAD_EXTENSION"}
-
-_WRITE_PATTERN = re.compile(
-    r'\b(INSERT\s+INTO|INSERT\s+OR\s+\w+\s+INTO|UPDATE\s|DELETE\s+FROM|REPLACE\s+INTO)\b',
-    re.IGNORECASE,
-)
-_DDL_PATTERN = re.compile(
-    r'\b(CREATE\s+(TABLE|INDEX|VIEW|TRIGGER)|DROP\s+(TABLE|INDEX|VIEW|TRIGGER)|ALTER\s+TABLE|RENAME\s|VACUUM|REINDEX)\b',
-    re.IGNORECASE,
-)
-_DANGEROUS_PATTERN = re.compile(
-    r'\b(ATTACH|DETACH|LOAD_EXTENSION)\b',
-    re.IGNORECASE,
-)
-
-
 def _strip_comments_and_strings(sql: str) -> str:
-    """Remove string literals and comments to avoid false positives on content inside them,
-    but keep keywords that are part of actual SQL structure."""
+    """Strip comments and string literals, replacing them with safe placeholders."""
     result = []
     i = 0
-    while i < len(sql):
-        if sql[i] == '-' and i + 1 < len(sql) and sql[i + 1] == '-':
-            while i < len(sql) and sql[i] != '\n':
+    n = len(sql)
+    while i < n:
+        # Single-line comment
+        if sql[i] == '-' and i + 1 < n and sql[i + 1] == '-':
+            while i < n and sql[i] != '\n':
                 i += 1
-        elif sql[i] == '/' and i + 1 < len(sql) and sql[i + 1] == '*':
+        # Block comment
+        elif sql[i] == '/' and i + 1 < n and sql[i + 1] == '*':
             i += 2
-            while i + 1 < len(sql) and not (sql[i] == '*' and sql[i + 1] == '/'):
+            while i + 1 < n and not (sql[i] == '*' and sql[i + 1] == '/'):
                 i += 1
             i += 2
+        # Single-quoted string
         elif sql[i] == "'":
-            result.append("''")
+            result.append("'_'")
             i += 1
-            while i < len(sql):
-                if sql[i] == "'" and i + 1 < len(sql) and sql[i + 1] == "'":
+            while i < n:
+                if sql[i] == "'" and i + 1 < n and sql[i + 1] == "'":
                     i += 2
                 elif sql[i] == "'":
                     i += 1
                     break
                 else:
                     i += 1
+        # Double-quoted identifier (keep as-is since it's a name, not a value)
+        elif sql[i] == '"':
+            result.append(sql[i])
+            i += 1
+            while i < n:
+                if sql[i] == '"':
+                    result.append(sql[i])
+                    i += 1
+                    break
+                else:
+                    result.append(sql[i])
+                    i += 1
         else:
             result.append(sql[i])
             i += 1
     return "".join(result)
+
+
+# Matches any write DML regardless of position (handles WITH...INSERT, comments before, etc.)
+_WRITE_PATTERNS = [
+    re.compile(r'\bINSERT\s+(OR\s+\w+\s+)?INTO\b', re.IGNORECASE),
+    re.compile(r'\bINSERT\s+INTO\b', re.IGNORECASE),
+    re.compile(r'\bREPLACE\s+INTO\b', re.IGNORECASE),
+    re.compile(r'\bUPDATE\b(?!\s*\()', re.IGNORECASE),  # UPDATE but not UPDATE() function
+    re.compile(r'\bDELETE\s+FROM\b', re.IGNORECASE),
+    re.compile(r'\bDELETE\b(?!\s*\()', re.IGNORECASE),  # bare DELETE
+    re.compile(r'\bUPSERT\b', re.IGNORECASE),
+    re.compile(r'\bMERGE\b', re.IGNORECASE),
+]
+
+_DDL_PATTERNS = [
+    re.compile(r'\bCREATE\s+(TEMP\s+|TEMPORARY\s+)?(TABLE|INDEX|VIEW|TRIGGER|VIRTUAL\s+TABLE)\b', re.IGNORECASE),
+    re.compile(r'\bDROP\s+(TABLE|INDEX|VIEW|TRIGGER)\b', re.IGNORECASE),
+    re.compile(r'\bDROP\s+IF\s+EXISTS\b', re.IGNORECASE),
+    re.compile(r'\bALTER\s+TABLE\b', re.IGNORECASE),
+    re.compile(r'\bVACUUM\b', re.IGNORECASE),
+    re.compile(r'\bREINDEX\b', re.IGNORECASE),
+    re.compile(r'\bANALYZE\b', re.IGNORECASE),
+]
+
+_DANGEROUS_PATTERNS = [
+    re.compile(r'\bATTACH\b', re.IGNORECASE),
+    re.compile(r'\bDETACH\b', re.IGNORECASE),
+    re.compile(r'\bLOAD_EXTENSION\b', re.IGNORECASE),
+]
+
+# Multi-statement detection: semicolons that aren't inside strings
+_SEMICOLON_SPLIT = re.compile(r';')
 
 
 class SQLSandbox:
@@ -68,23 +97,42 @@ class SQLSandbox:
     def validate(self, sql: str) -> dict[str, Any]:
         cleaned = _strip_comments_and_strings(sql)
 
-        if _DANGEROUS_PATTERN.search(cleaned):
-            match = _DANGEROUS_PATTERN.search(cleaned)
-            return {"allowed": False, "reason": f"'{match.group(1).upper()}' is not permitted"}
+        # Block multi-statement queries (semicolons followed by non-whitespace)
+        statements = [s.strip() for s in _SEMICOLON_SPLIT.split(cleaned) if s.strip()]
+        if len(statements) > 1:
+            return {"allowed": False, "reason": "Multi-statement queries are not permitted"}
 
+        # Dangerous operations (always blocked)
+        for pattern in _DANGEROUS_PATTERNS:
+            m = pattern.search(cleaned)
+            if m:
+                return {"allowed": False, "reason": f"'{m.group(0).strip().upper()}' is not permitted"}
+
+        # Write operations
         if not self._permissions.get("allow_sql_write", False):
-            if _WRITE_PATTERN.search(cleaned):
-                return {"allowed": False, "reason": "Write operations are disabled"}
+            for pattern in _WRITE_PATTERNS:
+                if pattern.search(cleaned):
+                    return {"allowed": False, "reason": "Write operations are disabled"}
 
+        # DDL operations
         if not self._permissions.get("allow_sql_ddl", False):
-            if _DDL_PATTERN.search(cleaned):
-                return {"allowed": False, "reason": "DDL operations are disabled"}
+            for pattern in _DDL_PATTERNS:
+                if pattern.search(cleaned):
+                    return {"allowed": False, "reason": "DDL operations are disabled"}
 
+        # Blocked tables
         blocked = self._permissions.get("blocked_tables", [])
         for table in blocked:
             pattern = re.compile(r'\b' + re.escape(table) + r'\b', re.IGNORECASE)
             if pattern.search(cleaned):
                 return {"allowed": False, "reason": f"Access to table '{table}' is blocked"}
+
+        # PRAGMA writes (some PRAGMAs modify state)
+        if re.search(r'\bPRAGMA\b', cleaned, re.IGNORECASE):
+            # Allow read-only PRAGMAs (those with no assignment)
+            if re.search(r'\bPRAGMA\s+\w+\s*=', cleaned, re.IGNORECASE):
+                if not self._permissions.get("allow_sql_write", False):
+                    return {"allowed": False, "reason": "PRAGMA writes are disabled"}
 
         return {"allowed": True}
 

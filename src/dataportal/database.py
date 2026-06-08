@@ -138,19 +138,56 @@ class DatabaseRegistry:
         if cursor.description:
             columns = [d[0] for d in cursor.description]
             rows = await cursor.fetchall()
+            row_list = [list(r) for r in rows]
+
+            # Infer actual column types from result data using typeof() on first non-null values
+            column_types = await self._infer_result_types(conn, columns, row_list)
+
             return {
                 "columns": columns,
-                "rows": [list(r) for r in rows],
-                "row_count": len(rows),
+                "column_types": column_types,
+                "rows": row_list,
+                "row_count": len(row_list),
             }
         else:
             await conn.commit()
             return {
                 "columns": [],
+                "column_types": [],
                 "rows": [],
                 "row_count": cursor.rowcount,
                 "message": f"Query executed, {cursor.rowcount} rows affected",
             }
+
+    async def _infer_result_types(
+        self, conn: aiosqlite.Connection, columns: list[str], rows: list[list]
+    ) -> list[str]:
+        """Infer column types from actual result data rather than schema lookups.
+        This correctly handles aliases, expressions, and cross-table same-named columns."""
+        if not rows:
+            return ["UNKNOWN"] * len(columns)
+
+        types = []
+        for col_idx in range(len(columns)):
+            inferred = "NULL"
+            for row in rows[:50]:
+                val = row[col_idx]
+                if val is None:
+                    continue
+                if isinstance(val, int):
+                    inferred = "INTEGER"
+                    break
+                elif isinstance(val, float):
+                    inferred = "REAL"
+                    break
+                elif isinstance(val, bytes):
+                    inferred = "BLOB"
+                    break
+                else:
+                    inferred = "TEXT"
+                    break
+            types.append(inferred)
+        return types
 
     async def close_all(self):
         for conn in self._connections.values():

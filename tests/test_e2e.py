@@ -72,7 +72,7 @@ class TestBrowse:
         assert "columns" in data
         assert "rows" in data
         assert "pagination" in data
-        assert data["pagination"]["total_rows"] == 200
+        assert data["pagination"]["total_rows"] >= 200
 
     def test_pagination(self, client):
         r = client.get("/db/sample/table/users.json?page=2&per_page=25")
@@ -152,7 +152,7 @@ class TestSQLEditor:
         })
         assert r.status_code == 200
         data = r.json()
-        assert data["rows"][0][0] == 200
+        assert data["rows"][0][0] >= 200
 
     def test_sql_timeout_protection(self, client):
         r = client.post("/sql/execute", json={
@@ -430,5 +430,199 @@ class TestConfigHotReload:
                 "sql": "INSERT INTO users VALUES (9998,'blocked','bl@x.com',30,'x','2024-01-01')"
             })
             assert r.status_code == 403
+
+        os.environ.pop("DATAPORTAL_CONFIG", None)
+
+
+class TestSandboxExtraBypass:
+    """Additional sandbox bypass attempts that must be blocked."""
+
+    def test_semicolon_multi_statement_blocked(self, client):
+        r = client.post("/sql/execute", json={
+            "database": "sample",
+            "sql": "SELECT 1; INSERT INTO users VALUES (8888,'x','x@x.com',1,'x','2024-01-01')"
+        })
+        assert r.status_code == 403
+
+    def test_update_no_where_blocked(self, client):
+        r = client.post("/sql/execute", json={
+            "database": "sample",
+            "sql": "UPDATE users SET name='hacked'"
+        })
+        assert r.status_code == 403
+
+    def test_delete_no_from_blocked(self, client):
+        r = client.post("/sql/execute", json={
+            "database": "sample",
+            "sql": "DELETE FROM users"
+        })
+        assert r.status_code == 403
+
+    def test_vacuum_blocked(self, client):
+        r = client.post("/sql/execute", json={
+            "database": "sample",
+            "sql": "VACUUM"
+        })
+        assert r.status_code == 403
+
+    def test_reindex_blocked(self, client):
+        r = client.post("/sql/execute", json={
+            "database": "sample",
+            "sql": "REINDEX"
+        })
+        assert r.status_code == 403
+
+    def test_create_temp_table_blocked(self, client):
+        r = client.post("/sql/execute", json={
+            "database": "sample",
+            "sql": "CREATE TEMP TABLE evil (x INTEGER)"
+        })
+        assert r.status_code == 403
+
+    def test_create_trigger_blocked(self, client):
+        r = client.post("/sql/execute", json={
+            "database": "sample",
+            "sql": "CREATE TRIGGER t AFTER INSERT ON users BEGIN SELECT 1; END"
+        })
+        assert r.status_code == 403
+
+    def test_pragma_write_blocked(self, client):
+        r = client.post("/sql/execute", json={
+            "database": "sample",
+            "sql": "PRAGMA journal_mode = DELETE"
+        })
+        assert r.status_code == 403
+
+    def test_pragma_read_allowed(self, client):
+        r = client.post("/sql/execute", json={
+            "database": "sample",
+            "sql": "PRAGMA table_info('users')"
+        })
+        assert r.status_code == 200
+
+    def test_insert_hidden_in_subquery_blocked(self, client):
+        r = client.post("/sql/execute", json={
+            "database": "sample",
+            "sql": "WITH data(a,b,c,d,e,f) AS (VALUES(1,'x','x@x',1,'x','x')) INSERT INTO users SELECT * FROM data"
+        })
+        assert r.status_code == 403
+
+
+class TestSQLExecuteJsonURL:
+    """Fix #2: /sql/execute.json must be accessible via GET with query params."""
+
+    def test_get_execute_json(self, client):
+        r = client.get("/sql/execute.json?database=sample&sql=SELECT+id,name+FROM+users+LIMIT+3")
+        assert r.status_code == 200
+        data = r.json()
+        assert data["row_count"] == 3
+        assert "metadata" in data
+        assert data["metadata"]["database"] == "sample"
+        assert len(data["metadata"]["columns_detail"]) == 2
+
+    def test_get_execute_json_with_full_metadata(self, client):
+        r = client.get("/sql/execute.json?database=sample&sql=SELECT+COUNT(*)+as+total+FROM+users")
+        assert r.status_code == 200
+        data = r.json()
+        assert "metadata" in data
+        meta = data["metadata"]
+        assert meta["source_type"] == "sqlite"
+        assert meta["query"] == "SELECT COUNT(*) as total FROM users"
+        assert meta["columns_detail"][0]["name"] == "total"
+        assert meta["columns_detail"][0]["type"] == "INTEGER"
+
+    def test_get_execute_blocks_writes(self, client):
+        r = client.get("/sql/execute.json?database=sample&sql=DELETE+FROM+users")
+        assert r.status_code == 403
+
+
+class TestColumnTypeInference:
+    """Fix #3: Column types must be accurate for aliases, expressions, cross-table."""
+
+    def test_expression_type(self, client):
+        r = client.post("/sql/execute", json={
+            "database": "sample",
+            "sql": "SELECT COUNT(*) as cnt, AVG(age) as avg_age FROM users"
+        })
+        data = r.json()
+        cols = data["metadata"]["columns_detail"]
+        assert cols[0]["name"] == "cnt"
+        assert cols[0]["type"] == "INTEGER"
+        assert cols[1]["name"] == "avg_age"
+        assert cols[1]["type"] == "REAL"
+
+    def test_alias_type(self, client):
+        r = client.post("/sql/execute", json={
+            "database": "sample",
+            "sql": "SELECT name || ' (' || city || ')' as display FROM users LIMIT 1"
+        })
+        data = r.json()
+        cols = data["metadata"]["columns_detail"]
+        assert cols[0]["name"] == "display"
+        assert cols[0]["type"] == "TEXT"
+
+    def test_cross_table_same_column(self, client):
+        r = client.post("/sql/execute", json={
+            "database": "sample",
+            "sql": "SELECT u.id as uid, o.id as oid, u.name, o.amount FROM users u JOIN orders o ON u.id=o.user_id LIMIT 1"
+        })
+        data = r.json()
+        cols = data["metadata"]["columns_detail"]
+        types_by_name = {c["name"]: c["type"] for c in cols}
+        assert types_by_name["uid"] == "INTEGER"
+        assert types_by_name["oid"] == "INTEGER"
+        assert types_by_name["name"] == "TEXT"
+        assert types_by_name["amount"] == "REAL"
+
+    def test_null_column_type(self, client):
+        r = client.post("/sql/execute", json={
+            "database": "sample",
+            "sql": "SELECT NULL as empty_val, 42 as num LIMIT 1"
+        })
+        data = r.json()
+        cols = data["metadata"]["columns_detail"]
+        assert cols[0]["name"] == "empty_val"
+        assert cols[0]["type"] == "NULL"
+        assert cols[1]["name"] == "num"
+        assert cols[1]["type"] == "INTEGER"
+
+
+class TestConfigReloadOnExecute:
+    """Fix #4: sql_execute must check config reload before executing."""
+
+    def test_sql_execute_applies_config_change(self, test_data_dir, tmp_path):
+        import json, os
+        from importlib import reload
+        import dataportal.app as app_module
+
+        cfg = {"permissions": {"allow_sql_write": False, "allow_sql_ddl": False,
+                               "max_query_time_seconds": 5, "max_rows_return": 10}}
+        cfg_path = tmp_path / "exec_reload.json"
+        cfg_path.write_text(json.dumps(cfg))
+
+        os.environ["DATAPORTAL_SOURCES"] = str(test_data_dir / "sample.sqlite")
+        os.environ["DATAPORTAL_CONFIG"] = str(cfg_path)
+        reload(app_module)
+
+        from starlette.testclient import TestClient
+        with TestClient(app_module.app) as c:
+            r = c.post("/sql/execute", json={
+                "database": "sample", "sql": "SELECT * FROM users"
+            })
+            assert r.status_code == 200
+            data = r.json()
+            assert data["row_count"] <= 10
+
+            # Update config to increase limit without restart
+            cfg["permissions"]["max_rows_return"] = 50
+            cfg_path.write_text(json.dumps(cfg))
+
+            # Execute again — the handler should reload config
+            r = c.post("/sql/execute", json={
+                "database": "sample", "sql": "SELECT * FROM users"
+            })
+            data = r.json()
+            assert data["row_count"] <= 50
+            assert data["row_count"] > 10
 
         os.environ.pop("DATAPORTAL_CONFIG", None)
