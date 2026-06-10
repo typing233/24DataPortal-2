@@ -1,4 +1,4 @@
-"""Main Starlette application with all routes."""
+"""Main Starlette application with all routes and plugin integration."""
 import asyncio
 import json
 import os
@@ -11,7 +11,7 @@ from starlette.applications import Starlette
 from starlette.middleware import Middleware
 from starlette.middleware.cors import CORSMiddleware
 from starlette.requests import Request
-from starlette.responses import JSONResponse, HTMLResponse
+from starlette.responses import JSONResponse, HTMLResponse, Response
 from starlette.routing import Route, Mount
 from starlette.staticfiles import StaticFiles
 from starlette.templating import Jinja2Templates
@@ -21,16 +21,15 @@ from dataportal.database import DatabaseRegistry
 from dataportal.importer import CSVImporter
 from dataportal.cache import TTLCache
 from dataportal.sandbox import SQLSandbox
+from dataportal.context import AppContext
+from dataportal.plugins.manager import PluginManager
 
 BASE_DIR = Path(__file__).parent
 templates = Jinja2Templates(directory=str(BASE_DIR / "templates"))
 
-registry = DatabaseRegistry()
-config: Config = None
-importer: CSVImporter = None
-cache: TTLCache = None
-sandbox: SQLSandbox = None
-saved_views: dict[str, list[dict]] = {}
+
+def _get_ctx(request: Request) -> AppContext:
+    return request.app.state.ctx
 
 
 def wants_json(request: Request) -> bool:
@@ -49,9 +48,7 @@ def strip_json_suffix(path: str) -> str:
     return path
 
 
-async def startup():
-    global config, importer, cache, sandbox
-
+async def _startup(app: Starlette):
     config_path = os.environ.get("DATAPORTAL_CONFIG")
     config = Config(config_path)
 
@@ -63,100 +60,134 @@ async def startup():
 
     sandbox = SQLSandbox(config.permissions)
     importer = CSVImporter(config.import_config)
+    registry = DatabaseRegistry()
+    plugin_manager = PluginManager()
+
+    state_file = Path.home() / ".dataportal" / "plugins.json"
+    plugin_manager.set_state_file(state_file)
+
+    ctx = AppContext(
+        config=config,
+        registry=registry,
+        cache=cache,
+        sandbox=sandbox,
+        importer=importer,
+        plugin_manager=plugin_manager,
+    )
+    app.state.ctx = ctx
 
     sources = os.environ.get("DATAPORTAL_SOURCES", "").split("|")
     for source in sources:
         if not source:
             continue
-        await _register_source(source)
+        await _register_source(ctx, source)
+
+    # Initialize plugins
+    await plugin_manager.initialize_all(ctx)
+
+    # Register plugin-provided Jinja2 global
+    templates.env.globals["plugin_blocks"] = lambda point: ""
+    templates.env.globals["plugin_nav_items"] = plugin_manager.get_nav_items
+    templates.env.globals["output_formats"] = plugin_manager.get_output_formats
+
+    # Conditionally register write API routes
+    if config.get("write_api", "enabled", default=False):
+        from dataportal.write import get_write_routes
+        for route in get_write_routes():
+            app.routes.insert(-1, route)
 
 
-def _apply_config_changes():
-    """Apply config changes to sandbox, cache, and importer at runtime."""
-    sandbox.update_permissions(config.permissions)
-    cache_cfg = config.cache_config
+def _apply_config_changes(ctx: AppContext):
+    ctx.sandbox.update_permissions(ctx.config.permissions)
+    cache_cfg = ctx.config.cache_config
     new_ttl = cache_cfg.get("ttl_seconds", 60)
     new_max = cache_cfg.get("max_entries", 1000)
-    if new_ttl != cache._ttl or new_max != cache._max_entries:
-        cache._ttl = new_ttl
-        cache._max_entries = new_max
-        cache.clear()
-    importer._config = config.import_config
+    if new_ttl != ctx.cache._ttl or new_max != ctx.cache._max_entries:
+        ctx.cache._ttl = new_ttl
+        ctx.cache._max_entries = new_max
+        ctx.cache.clear()
+    ctx.importer._config = ctx.config.import_config
 
 
-async def _register_source(source: str):
+async def _register_source(ctx: AppContext, source: str):
     path = Path(source).resolve()
     if path.is_dir():
         for f in sorted(path.iterdir()):
             if f.name.startswith("."):
                 continue
             if f.suffix == ".sqlite" or f.suffix == ".db":
-                await registry.register(f.stem, str(f), "sqlite")
+                await ctx.registry.register(f.stem, str(f), "sqlite")
             elif f.suffix == ".csv":
-                await _import_csv(f)
+                await _import_csv(ctx, f)
     elif path.suffix in (".sqlite", ".db"):
-        await registry.register(path.stem, str(path), "sqlite")
+        await ctx.registry.register(path.stem, str(path), "sqlite")
     elif path.suffix == ".csv":
-        await _import_csv(path)
+        await _import_csv(ctx, path)
 
 
-async def _import_csv(csv_path: Path):
+async def _import_csv(ctx: AppContext, csv_path: Path):
     db_name = csv_path.stem + "_csv"
     db_path = str(csv_path.parent / f".{csv_path.stem}.sqlite")
 
-    await importer.load_existing_hashes(db_path, db_name)
-    status = await importer.import_csv(str(csv_path), db_path, db_name)
+    await ctx.importer.load_existing_hashes(db_path, db_name)
+    status = await ctx.importer.import_csv(str(csv_path), db_path, db_name)
 
     if status.status in ("completed", "skipped"):
-        await registry.register(db_name, db_path, "csv")
+        await ctx.registry.register(db_name, db_path, "csv")
 
 
-async def shutdown():
-    await registry.close_all()
+async def _shutdown(app: Starlette):
+    ctx: AppContext = app.state.ctx
+    # Shutdown all plugins
+    for name in list(ctx.plugin_manager._plugins.keys()):
+        await ctx.plugin_manager.unload(name)
+    await ctx.registry.close_all()
 
+
+# --- Route handlers ---
 
 async def homepage(request: Request):
-    reloaded = await config.check_reload()
+    ctx = _get_ctx(request)
+    reloaded = await ctx.config.check_reload()
     if reloaded:
-        _apply_config_changes()
+        _apply_config_changes(ctx)
 
     dbs = []
-    for name, info in registry.databases.items():
+    for name, info in ctx.registry.databases.items():
         dbs.append(info.to_dict())
 
     health = {
         "status": "healthy",
-        "databases": len(registry.databases),
-        "total_tables": sum(len(d.tables) for d in registry.databases.values()),
-        "total_views": sum(len(d.views) for d in registry.databases.values()),
-        "cache_entries": cache.size,
-        "uptime_seconds": time.time() - _start_time,
+        "databases": len(ctx.registry.databases),
+        "total_tables": sum(len(d.tables) for d in ctx.registry.databases.values()),
+        "total_views": sum(len(d.views) for d in ctx.registry.databases.values()),
+        "cache_entries": ctx.cache.size,
+        "uptime_seconds": time.time() - ctx.start_time,
     }
 
     import_statuses = {
         k: {"status": v.status, "progress": v.progress, "rows": v.rows_imported}
-        for k, v in importer.status_map.items()
+        for k, v in ctx.importer.status_map.items()
     }
 
     context = {
         "databases": dbs,
         "health": health,
         "imports": import_statuses,
-        "site_config": {"site": config.site, "theme": config.theme},
+        "site_config": {"site": ctx.config.site, "theme": ctx.config.theme},
     }
 
     if wants_json(request):
         return JSONResponse(context)
 
-    return templates.TemplateResponse(
-        request, "index.html", context
-    )
+    return templates.TemplateResponse(request, "index.html", context)
 
 
 async def browse_table(request: Request):
-    reloaded = await config.check_reload()
+    ctx = _get_ctx(request)
+    reloaded = await ctx.config.check_reload()
     if reloaded:
-        _apply_config_changes()
+        _apply_config_changes(ctx)
 
     db_name = request.path_params["db"]
     table_name = request.path_params["table"]
@@ -170,16 +201,17 @@ async def browse_table(request: Request):
     filter_val = request.query_params.get("filter_val", "")
     search = request.query_params.get("search", "")
 
+    # Check for plugin output format
+    output_format = request.query_params.get("format", "")
+
     cache_key = f"browse:{db_name}:{table_name}:{page}:{per_page}:{sort}:{filter_col}:{filter_val}:{search}"
-    cached = cache.get(cache_key)
-    if cached:
+    cached = ctx.cache.get(cache_key)
+    if cached and output_format not in ("csv", "xml"):
         if wants_json(request):
             return JSONResponse(cached)
-        return templates.TemplateResponse(
-            request, "browse.html", dict(cached)
-        )
+        return templates.TemplateResponse(request, "browse.html", dict(cached))
 
-    conn = await registry.get_connection(db_name)
+    conn = await ctx.registry.get_connection(db_name)
 
     col_cursor = await conn.execute(f'PRAGMA table_info("{table_name}")')
     columns = await col_cursor.fetchall()
@@ -250,27 +282,33 @@ async def browse_table(request: Request):
         "filter_val": filter_val,
         "search": search,
         "indexes": indexes,
-        "source": registry.databases[db_name].source_type,
-        "site_config": {"site": config.site, "theme": config.theme},
+        "source": ctx.registry.databases[db_name].source_type,
+        "site_config": {"site": ctx.config.site, "theme": ctx.config.theme},
     }
 
-    cache.set(result, cache_key)
+    ctx.cache.set(result, cache_key)
+
+    # Plugin output format handling
+    if output_format and output_format not in ("json", "html"):
+        plugin = ctx.plugin_manager.get_output_plugin(output_format)
+        if plugin:
+            data = plugin.render(col_names, result["rows"], {"database": db_name, "table": table_name})
+            return Response(data, media_type=plugin.content_type())
 
     if wants_json(request):
         return JSONResponse(result)
 
-    return templates.TemplateResponse(
-        request, "browse.html", dict(result)
-    )
+    return templates.TemplateResponse(request, "browse.html", dict(result))
 
 
 async def save_view(request: Request):
+    ctx = _get_ctx(request)
     body = await request.json()
     db_name = body.get("database", "")
     key = f"{db_name}"
-    if key not in saved_views:
-        saved_views[key] = []
-    saved_views[key].append({
+    if key not in ctx.saved_views:
+        ctx.saved_views[key] = []
+    ctx.saved_views[key].append({
         "name": body.get("name", "Untitled"),
         "table": body.get("table"),
         "sort": body.get("sort", ""),
@@ -279,44 +317,45 @@ async def save_view(request: Request):
         "search": body.get("search", ""),
         "created_at": time.time(),
     })
-    return JSONResponse({"status": "saved", "views": saved_views[key]})
+    return JSONResponse({"status": "saved", "views": ctx.saved_views[key]})
 
 
 async def list_views(request: Request):
+    ctx = _get_ctx(request)
     db_name = request.path_params.get("db", "")
-    views = saved_views.get(db_name, [])
+    views = ctx.saved_views.get(db_name, [])
     return JSONResponse({"views": views})
 
 
 async def sql_editor(request: Request):
-    reloaded = await config.check_reload()
+    ctx = _get_ctx(request)
+    reloaded = await ctx.config.check_reload()
     if reloaded:
-        _apply_config_changes()
+        _apply_config_changes(ctx)
 
     db_name = request.path_params.get("db", "")
     if db_name.endswith(".json"):
         db_name = db_name[:-5]
-    databases = list(registry.databases.keys())
+    databases = list(ctx.registry.databases.keys())
 
     context = {
         "database": db_name,
         "databases": databases,
-        "history": sandbox.history,
-        "site_config": {"site": config.site, "theme": config.theme},
+        "history": ctx.sandbox.history,
+        "site_config": {"site": ctx.config.site, "theme": ctx.config.theme},
     }
 
     if wants_json(request):
         return JSONResponse(context)
 
-    return templates.TemplateResponse(
-        request, "sql.html", context
-    )
+    return templates.TemplateResponse(request, "sql.html", context)
 
 
 async def sql_execute(request: Request):
-    reloaded = await config.check_reload()
+    ctx = _get_ctx(request)
+    reloaded = await ctx.config.check_reload()
     if reloaded:
-        _apply_config_changes()
+        _apply_config_changes(ctx)
 
     if request.method == "GET":
         db_name = request.query_params.get("database", "")
@@ -326,32 +365,43 @@ async def sql_execute(request: Request):
         db_name = body.get("database", "")
         sql = body.get("sql", "").strip()
 
-    if not db_name or db_name not in registry.databases:
+    if not db_name or db_name not in ctx.registry.databases:
         return JSONResponse({"error": "Invalid database"}, status_code=400)
     if not sql:
         return JSONResponse({"error": "Empty query"}, status_code=400)
 
-    sandbox.update_permissions(config.permissions)
-    validation = sandbox.validate(sql)
+    ctx.sandbox.update_permissions(ctx.config.permissions)
+    validation = ctx.sandbox.validate(sql)
     if not validation["allowed"]:
         return JSONResponse(
             {"error": validation["reason"], "allowed": False}, status_code=403
         )
 
-    timeout = config.permissions.get("max_query_time_seconds", 30)
-    max_rows = config.permissions.get("max_rows_return", 10000)
+    # Apply SQL filter plugins (pre-processing)
+    for filter_plugin in ctx.plugin_manager.get_sql_filters():
+        sql = filter_plugin.pre_process(sql, {"database": db_name})
+
+    timeout = ctx.config.permissions.get("max_query_time_seconds", 30)
+    max_rows = ctx.config.permissions.get("max_rows_return", 10000)
 
     limited_sql = sql
     if sql.strip().upper().startswith("SELECT") and "LIMIT" not in sql.upper():
         limited_sql = f"{sql} LIMIT {max_rows}"
 
-    result = await registry.execute_query(db_name, limited_sql, timeout=timeout)
-    sandbox.record(db_name, sql, result)
+    result = await ctx.registry.execute_query(db_name, limited_sql, timeout=timeout)
+    ctx.sandbox.record(db_name, sql, result)
 
     if result.get("error"):
-        result["explanation"] = sandbox.explain_error(result["error"])
+        result["explanation"] = ctx.sandbox.explain_error(result["error"])
 
-    db_info = registry.databases[db_name]
+    # Apply SQL filter plugins (post-processing / masking)
+    if not result.get("error") and result.get("columns"):
+        for filter_plugin in ctx.plugin_manager.get_sql_filters():
+            result["columns"], result["rows"] = filter_plugin.post_process(
+                result["columns"], result["rows"], {"database": db_name}
+            )
+
+    db_info = ctx.registry.databases[db_name]
     column_types = result.pop("column_types", [])
     result["metadata"] = {
         "database": db_name,
@@ -364,61 +414,88 @@ async def sql_execute(request: Request):
         ],
     }
 
+    # Plugin output format
+    output_format = request.query_params.get("format", "")
+    if output_format and output_format not in ("json", "html"):
+        plugin = ctx.plugin_manager.get_output_plugin(output_format)
+        if plugin:
+            data = plugin.render(
+                result.get("columns", []),
+                result.get("rows", []),
+                result.get("metadata", {}),
+            )
+            return Response(data, media_type=plugin.content_type())
+
     return JSONResponse(result)
 
 
 async def sql_history(request: Request):
-    return JSONResponse({"history": sandbox.history})
+    ctx = _get_ctx(request)
+    return JSONResponse({"history": ctx.sandbox.history})
 
 
 async def health_check(request: Request):
+    ctx = _get_ctx(request)
+    plugin_health = []
+    for info in ctx.plugin_manager.list_plugins():
+        plugin_health.append({"name": info["name"], "state": info["state"]})
+
     return JSONResponse({
         "status": "healthy",
-        "databases": len(registry.databases),
-        "uptime_seconds": time.time() - _start_time,
+        "databases": len(ctx.registry.databases),
+        "uptime_seconds": time.time() - ctx.start_time,
+        "plugins": plugin_health,
     })
 
 
 async def config_endpoint(request: Request):
-    await config.check_reload()
-    return JSONResponse(config.to_dict())
+    ctx = _get_ctx(request)
+    await ctx.config.check_reload()
+    return JSONResponse(ctx.config.to_dict())
 
 
-_start_time = time.time()
+async def plugins_endpoint(request: Request):
+    ctx = _get_ctx(request)
+    return JSONResponse({"plugins": ctx.plugin_manager.list_plugins()})
 
 
-routes = [
-    Route("/", homepage),
-    Route("/.json", homepage),
-    Route("/health", health_check),
-    Route("/config.json", config_endpoint),
-    Route("/db/{db}/table/{table}", browse_table),
-    Route("/db/{db}/views", list_views),
-    Route("/views/save", save_view, methods=["POST"]),
-    Route("/sql/execute", sql_execute, methods=["GET", "POST"]),
-    Route("/sql/execute.json", sql_execute, methods=["GET", "POST"]),
-    Route("/sql/history", sql_history),
-    Route("/sql/history.json", sql_history),
-    Route("/sql", sql_editor),
-    Route("/sql.json", sql_editor),
-    Route("/sql/{db}", sql_editor),
-    Mount("/static", StaticFiles(directory=str(BASE_DIR / "static")), name="static"),
-]
+# --- App factory ---
 
-middleware = [
-    Middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"]),
-]
+def create_app() -> Starlette:
+    routes = [
+        Route("/", homepage),
+        Route("/.json", homepage),
+        Route("/health", health_check),
+        Route("/config.json", config_endpoint),
+        Route("/plugins.json", plugins_endpoint),
+        Route("/db/{db}/table/{table}", browse_table),
+        Route("/db/{db}/views", list_views),
+        Route("/views/save", save_view, methods=["POST"]),
+        Route("/sql/execute", sql_execute, methods=["GET", "POST"]),
+        Route("/sql/execute.json", sql_execute, methods=["GET", "POST"]),
+        Route("/sql/history", sql_history),
+        Route("/sql/history.json", sql_history),
+        Route("/sql", sql_editor),
+        Route("/sql.json", sql_editor),
+        Route("/sql/{db}", sql_editor),
+        Mount("/static", StaticFiles(directory=str(BASE_DIR / "static")), name="static"),
+    ]
+
+    middleware = [
+        Middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"]),
+    ]
+
+    @asynccontextmanager
+    async def lifespan(application):
+        await _startup(application)
+        yield
+        await _shutdown(application)
+
+    return Starlette(
+        routes=routes,
+        middleware=middleware,
+        lifespan=lifespan,
+    )
 
 
-@asynccontextmanager
-async def lifespan(app):
-    await startup()
-    yield
-    await shutdown()
-
-
-app = Starlette(
-    routes=routes,
-    middleware=middleware,
-    lifespan=lifespan,
-)
+app = create_app()

@@ -38,6 +38,24 @@ DEFAULT_CONFIG = {
         "max_entries": 1000,
     },
     "data_sources": [],
+    "plugins": {
+        "enabled": True,
+        "require_signatures": False,
+        "trusted_keys": [],
+        "auto_discover": True,
+    },
+    "sql_filter": {
+        "row_filters": [],
+        "column_masks": [],
+    },
+    "write_api": {
+        "enabled": False,
+        "require_auth": True,
+        "auth_tokens": [],
+        "permissions": {},
+        "audit_log": True,
+        "idempotency_window_seconds": 3600,
+    },
 }
 
 

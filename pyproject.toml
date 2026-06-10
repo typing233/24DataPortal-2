@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "dataportal"
-version = "1.0.0"
-description = "Production-grade data portal for SQLite and CSV exploration"
+version = "2.0.0"
+description = "Plugin-based data portal with deployment support for SQLite and CSV exploration"
 requires-python = ">=3.10"
 dependencies = [
     "starlette>=0.27.0",
@@ -16,6 +16,9 @@ dependencies = [
     "python-multipart>=0.0.6",
     "chardet>=5.0.0",
     "watchfiles>=0.19.0",
+    "packaging>=23.0",
+    "pynacl>=1.5.0",
+    "sqlglot>=20.0.0",
 ]
 
 [project.optional-dependencies]
@@ -23,10 +26,17 @@ dev = [
     "pytest>=7.4.0",
     "pytest-asyncio>=0.21.0",
     "httpx>=0.24.0",
+    "pytest-mock>=3.12.0",
 ]
 
 [project.scripts]
 dataportal = "dataportal.cli:main"
+
+[project.entry-points."dataportal.plugins"]
+format-json = "dataportal.plugins.builtin.format_json:JSONOutputPlugin"
+format-csv = "dataportal.plugins.builtin.format_csv:CSVOutputPlugin"
+format-xml = "dataportal.plugins.builtin.format_xml:XMLOutputPlugin"
+sql-filter = "dataportal.plugins.builtin.sql_filter:ASTSQLFilterPlugin"
 
 [tool.setuptools.packages.find]
 where = ["src"]

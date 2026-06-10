@@ -1,3 +1,3 @@
-"""DataPortal - Production-grade data portal for SQLite and CSV exploration."""
+"""DataPortal - Plugin-based data portal with deployment support."""
 
-__version__ = "1.0.0"
+__version__ = "2.0.0"

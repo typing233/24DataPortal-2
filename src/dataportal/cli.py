@@ -2,11 +2,18 @@
 import click
 import uvicorn
 
+from dataportal.cli_plugin import plugin
+from dataportal.cli_publish import publish
+
 
 @click.group()
 def main():
-    """DataPortal - Interactive data exploration portal."""
+    """DataPortal - Interactive data exploration portal with plugin system."""
     pass
+
+
+main.add_command(plugin)
+main.add_command(publish)
 
 
 @main.command()
