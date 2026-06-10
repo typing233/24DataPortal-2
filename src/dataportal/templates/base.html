@@ -19,11 +19,16 @@
                 <a href="/">数据库</a>
                 <a href="/sql">SQL 编辑器</a>
                 <a href="/health">健康状态</a>
+                {% for item in plugin_nav_items() %}
+                <a href="{{ item.url }}">{{ item.label }}</a>
+                {% endfor %}
             </div>
         </nav>
     </header>
     <main>
+        {{ plugin_blocks("page.before_content") }}
         {% block content %}{% endblock %}
+        {{ plugin_blocks("page.after_content") }}
     </main>
     <footer>
         <p>{{ site_config.site.copyright | default('© 2024 DataPortal') }}</p>

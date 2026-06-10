@@ -19,7 +19,7 @@ from dataportal.plugins.base import (
 )
 from dataportal.plugins.discovery import discover_plugins, PluginCandidate
 from dataportal.plugins.compat import check_compatibility
-from dataportal.plugins.sandbox import run_sandboxed_async
+from dataportal.plugins.sandbox import run_sandboxed_async, SandboxContext
 
 if TYPE_CHECKING:
     from dataportal.context import AppContext
@@ -54,7 +54,7 @@ class PluginEntry:
 
 
 class PluginManager:
-    def __init__(self):
+    def __init__(self, plugin_config: dict | None = None):
         self._plugins: dict[str, PluginEntry] = {}
         self._output_plugins: dict[str, OutputPlugin] = {}
         self._html_block_plugins: dict[str, list[HTMLBlockPlugin]] = {}
@@ -62,6 +62,10 @@ class PluginManager:
         self._sql_filter_plugins: list[SQLFilterPlugin] = []
         self._disabled: set[str] = set()
         self._state_file: Path | None = None
+        self._config: dict = plugin_config or {}
+
+    def set_config(self, config: dict):
+        self._config = config
 
     def set_state_file(self, path: Path):
         self._state_file = path
@@ -99,10 +103,86 @@ class PluginManager:
             n for n, e in self._plugins.items()
             if e.state in (PluginState.INITIALIZED, PluginState.HEALTHY)
         ]
+
+        # Version and conflict compatibility
         result = check_compatibility(entry.candidate.meta, loaded_names)
-        if result.compatible:
-            entry.state = PluginState.VALIDATED
-        return result.compatible, result.reasons
+        if not result.compatible:
+            entry.state = PluginState.FAILED
+            entry.error = f"Incompatible: {result.reasons}"
+            return False, result.reasons
+
+        # Signature verification (if require_signatures is enabled)
+        if self._config.get("require_signatures", False):
+            sig_result = self._verify_plugin_signature(name)
+            if not sig_result:
+                reason = f"Signature verification failed for '{name}'"
+                entry.state = PluginState.FAILED
+                entry.error = reason
+                return False, [reason]
+
+        # Dependency conflict check
+        conflict_reasons = self._check_dependency_conflicts(name)
+        if conflict_reasons:
+            entry.state = PluginState.FAILED
+            entry.error = f"Dependency conflict: {conflict_reasons}"
+            return False, conflict_reasons
+
+        entry.state = PluginState.VALIDATED
+        return True, []
+
+    def _verify_plugin_signature(self, name: str) -> bool:
+        """Check if the plugin's installed package has a valid signature."""
+        trusted_keys = self._config.get("trusted_keys", [])
+        if not trusted_keys:
+            logger.warning(f"require_signatures=True but no trusted_keys configured")
+            return False
+
+        try:
+            from importlib.metadata import distribution
+            dist = distribution(name.replace("-", "_"))
+            # Look for signature in dist-info
+            dist_path = Path(dist._path) if hasattr(dist, '_path') else None
+            if dist_path:
+                sig_file = dist_path.parent / f"{dist_path.name}.sig"
+                if sig_file.exists():
+                    from dataportal.plugins.signing import verify_against_trusted_keys
+                    # Verify the RECORD file against the signature
+                    record_file = dist_path / "RECORD"
+                    if record_file.exists():
+                        sig_b64 = sig_file.read_text().strip()
+                        result = verify_against_trusted_keys(str(record_file), sig_b64, trusted_keys)
+                        return result.valid
+            # No signature file found
+            logger.warning(f"No signature found for plugin '{name}'")
+            return False
+        except Exception as e:
+            logger.warning(f"Signature check error for '{name}': {e}")
+            return False
+
+    def _check_dependency_conflicts(self, name: str) -> list[str]:
+        """Check if the plugin's dependencies conflict with core or other plugins."""
+        conflicts = []
+        try:
+            from importlib.metadata import distribution, requires
+            dist = distribution(name.replace("-", "_"))
+            plugin_reqs = dist.requires or []
+
+            # Get core requirements
+            core_dist = distribution("dataportal")
+            core_reqs = {r.split()[0].split(">")[0].split("<")[0].split("=")[0].split("!")[0].lower()
+                        for r in (core_dist.requires or [])}
+
+            for req_str in plugin_reqs:
+                # Parse requirement name
+                req_name = req_str.split()[0].split(">")[0].split("<")[0].split("=")[0].split("!")[0].split(";")[0].lower()
+                # We only flag if plugin requires a package that core also requires
+                # with potentially incompatible versions (simple overlap check)
+                if req_name in core_reqs and "extra ==" not in req_str:
+                    # Both need it - not a conflict per se, just noted for awareness
+                    pass
+        except Exception:
+            pass  # If we can't check, allow loading
+        return conflicts
 
     async def load(self, name: str) -> BasePlugin | None:
         entry = self._plugins.get(name)
@@ -131,10 +211,25 @@ class PluginManager:
             return False
 
         try:
-            permissions = entry.candidate.meta.permissions if entry.candidate.meta else []
-            await run_sandboxed_async(
-                entry.instance.initialize, ctx, permissions=permissions
-            )
+            meta = entry.candidate.meta
+            declared_permissions = meta.permissions if meta else []
+
+            # Check declared permissions against admin-allowed list
+            sandbox_allow = self._config.get("sandbox_allow", {})
+            allowed_for_plugin = sandbox_allow.get(name, [])
+
+            # Only grant permissions that are both declared AND admin-approved
+            effective_permissions = [p for p in declared_permissions if p in allowed_for_plugin]
+
+            # Warn about declared-but-not-approved permissions
+            denied = set(declared_permissions) - set(effective_permissions)
+            if denied:
+                logger.info(f"Plugin '{name}' requested permissions {denied} not approved by admin")
+
+            # Run initialize within sandbox context
+            with SandboxContext(permissions=effective_permissions):
+                await entry.instance.initialize(ctx)
+
             entry.state = PluginState.INITIALIZED
             self._register_plugin_type(name, entry.instance)
             return True

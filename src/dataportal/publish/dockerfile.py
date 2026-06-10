@@ -44,6 +44,10 @@ COPY --from=builder /install /usr/local
 COPY src/ /app/src/
 COPY pyproject.toml /app/
 
+# Copy entrypoint script
+COPY entrypoint.sh /app/entrypoint.sh
+RUN chmod +x /app/entrypoint.sh
+
 {data_copy}
 {config_copy}
 
@@ -51,9 +55,11 @@ COPY pyproject.toml /app/
 ENV PORT={port}
 {sources_env}
 {config_env}
+ENV DATAPORTAL_LOG_FORMAT=json
+ENV DATAPORTAL_LOG_LEVEL=info
 
 # Non-root user
-RUN useradd --create-home appuser
+RUN useradd --create-home appuser && chown -R appuser:appuser /app
 USER appuser
 
 EXPOSE {port}
@@ -61,5 +67,76 @@ EXPOSE {port}
 HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \\
     CMD python -c "import urllib.request; urllib.request.urlopen('http://localhost:{port}/health')"
 
-CMD ["python", "-m", "dataportal", "serve", "--host", "0.0.0.0", "--port", "{port}"]
+ENTRYPOINT ["/app/entrypoint.sh"]
+CMD ["dataportal", "serve", "--host", "0.0.0.0", "--port", "{port}"]
+"""
+
+
+def generate_entrypoint_script(port: int = 8001) -> str:
+    """Container entrypoint that handles DB migration before starting the app."""
+    return f"""#!/bin/bash
+set -e
+
+echo "[dataportal] Starting container initialization..."
+
+# --- Database Migration ---
+# If DATA_MIGRATE_FROM is set, copy seed data to the data volume
+if [ -n "${{DATA_MIGRATE_FROM}}" ] && [ -d "${{DATA_MIGRATE_FROM}}" ]; then
+    echo "[dataportal] Migrating data from ${{DATA_MIGRATE_FROM}} to /app/data..."
+    mkdir -p /app/data
+    cp -n "${{DATA_MIGRATE_FROM}}"/*.sqlite /app/data/ 2>/dev/null || true
+    cp -n "${{DATA_MIGRATE_FROM}}"/*.csv /app/data/ 2>/dev/null || true
+    echo "[dataportal] Data migration complete."
+fi
+
+# If DATAPORTAL_SOURCES is not set, default to /app/data
+if [ -z "${{DATAPORTAL_SOURCES}}" ] && [ -d "/app/data" ]; then
+    export DATAPORTAL_SOURCES="/app/data"
+fi
+
+# --- Secrets ---
+# Load secrets from env file if present (mounted via Docker secrets or volume)
+if [ -f "/run/secrets/dataportal.env" ]; then
+    echo "[dataportal] Loading secrets from /run/secrets/dataportal.env"
+    set -a
+    source /run/secrets/dataportal.env
+    set +a
+fi
+
+# If SECRETS_DIR is set, load all files as env vars (Cloud Run / K8s pattern)
+if [ -n "${{SECRETS_DIR}}" ] && [ -d "${{SECRETS_DIR}}" ]; then
+    echo "[dataportal] Loading secrets from ${{SECRETS_DIR}}/"
+    for f in "${{SECRETS_DIR}}"/*; do
+        if [ -f "$f" ]; then
+            varname=$(basename "$f")
+            export "$varname"="$(cat "$f")"
+        fi
+    done
+fi
+
+# --- Config generation from env ---
+# If DATAPORTAL_CONFIG is not set but env vars define config, generate one
+if [ -z "${{DATAPORTAL_CONFIG}}" ] && [ -n "${{DP_SITE_TITLE}}" ]; then
+    echo "[dataportal] Generating config.json from environment variables..."
+    python3 -c "
+import json, os
+config = {{}}
+if os.environ.get('DP_SITE_TITLE'):
+    config['site'] = {{'title': os.environ['DP_SITE_TITLE']}}
+if os.environ.get('DP_WRITE_API_ENABLED'):
+    config['write_api'] = {{'enabled': True, 'auth_tokens': os.environ.get('DP_AUTH_TOKENS', '').split(',')}}
+with open('/app/config.json', 'w') as f:
+    json.dump(config, f)
+print('[dataportal] Config generated at /app/config.json')
+"
+    export DATAPORTAL_CONFIG="/app/config.json"
+fi
+
+echo "[dataportal] Starting application..."
+echo "[dataportal] Port: ${{PORT:-{port}}}"
+echo "[dataportal] Sources: ${{DATAPORTAL_SOURCES:-none}}"
+echo "[dataportal] Config: ${{DATAPORTAL_CONFIG:-none}}"
+
+# Execute the main command
+exec "$@"
 """

@@ -1,4 +1,4 @@
-"""Write API request handlers."""
+"""Write API request handlers with unified idempotency and concurrency control."""
 from __future__ import annotations
 
 import json
@@ -40,6 +40,23 @@ async def _get_pk_column(conn, table_name: str) -> str | None:
     return None
 
 
+async def _check_idempotency(conn, request: Request, write_config: dict) -> tuple[str | None, dict | None]:
+    """Check idempotency key. Returns (key, cached_response) or (key, None) if not cached."""
+    idempotency_key = request.headers.get("idempotency-key")
+    if not idempotency_key:
+        return None, None
+    await ensure_idempotency_table(conn)
+    window = write_config.get("idempotency_window_seconds", 3600)
+    cached = await get_cached_response(conn, idempotency_key, window)
+    return idempotency_key, cached
+
+
+async def _store_idempotent_response(conn, key: str | None, status: int, body: dict):
+    """Store response for idempotency dedup if key is present."""
+    if key:
+        await store_response(conn, key, status, body)
+
+
 async def create_row(request: Request):
     """POST /api/db/{db}/table/{table} - Create one or more rows."""
     ctx = _get_ctx(request)
@@ -65,16 +82,11 @@ async def create_row(request: Request):
     conn = await ctx.registry.get_connection(db_name)
 
     # Idempotency check
-    idempotency_key = request.headers.get("idempotency-key")
-    if idempotency_key:
-        await ensure_idempotency_table(conn)
-        window = write_config.get("idempotency_window_seconds", 3600)
-        cached = await get_cached_response(conn, idempotency_key, window)
-        if cached:
-            return JSONResponse(cached["body"], status_code=cached["status"])
+    idempotency_key, cached = await _check_idempotency(conn, request, write_config)
+    if cached:
+        return JSONResponse(cached["body"], status_code=cached["status"])
 
     rows_data = body if isinstance(body, list) else [body]
-
     if not rows_data:
         return JSONResponse({"error": "No data provided"}, status_code=400)
 
@@ -104,19 +116,17 @@ async def create_row(request: Request):
 
         await conn.commit()
         response_body = {"status": "created", "ids": inserted_ids, "count": len(inserted_ids)}
-        status = 201
+        status_code = 201
 
-        if idempotency_key:
-            await store_response(conn, idempotency_key, status, response_body)
-
-        return JSONResponse(response_body, status_code=status)
+        await _store_idempotent_response(conn, idempotency_key, status_code, response_body)
+        return JSONResponse(response_body, status_code=status_code)
     except Exception as e:
         await conn.rollback()
         return JSONResponse({"error": str(e)}, status_code=400)
 
 
 async def update_row(request: Request):
-    """PUT /api/db/{db}/table/{table}/{pk} - Update a row."""
+    """PUT /api/db/{db}/table/{table}/{pk} - Update a row with concurrency control."""
     ctx = _get_ctx(request)
     write_config = _get_write_config(request)
 
@@ -138,13 +148,19 @@ async def update_row(request: Request):
         return JSONResponse({"error": "Database not found"}, status_code=404)
 
     conn = await ctx.registry.get_connection(db_name)
+
+    # Idempotency check
+    idempotency_key, cached = await _check_idempotency(conn, request, write_config)
+    if cached:
+        return JSONResponse(cached["body"], status_code=cached["status"])
+
     pk_column = await _get_pk_column(conn, table_name)
     if not pk_column:
         return JSONResponse({"error": "Table has no primary key"}, status_code=400)
 
     body = await request.json()
 
-    # Concurrency control
+    # Concurrency control via If-Match header
     if_match = request.headers.get("if-match")
     use_version = await has_version_column(conn, table_name)
 
@@ -159,13 +175,13 @@ async def update_row(request: Request):
         set_clauses = []
         values = []
         for col, val in body.items():
-            if col == pk_column:
+            if col == pk_column or col == "_version":
                 continue
             set_clauses.append(f'"{col}" = ?')
             values.append(val)
 
         if use_version:
-            set_clauses.append('"_version" = "_version" + 1')
+            set_clauses.append("_version = _version + 1")
 
         if not set_clauses:
             return JSONResponse({"error": "No fields to update"}, status_code=400)
@@ -183,16 +199,18 @@ async def update_row(request: Request):
                 before_data=before_row,
                 after_data=body,
                 user_token=token,
+                idempotency_key=idempotency_key,
             )
 
         await conn.commit()
 
         after_row, new_version = await get_row_with_version(conn, table_name, pk_column, pk_value)
-        response = {"status": "updated", "row": after_row}
+        response_body = {"status": "updated", "row": after_row}
         if new_version is not None:
-            response["version"] = new_version
+            response_body["version"] = new_version
 
-        return JSONResponse(response)
+        await _store_idempotent_response(conn, idempotency_key, 200, response_body)
+        return JSONResponse(response_body)
 
     except ConcurrencyConflictError as e:
         return JSONResponse({"error": e.message}, status_code=409)
@@ -202,7 +220,7 @@ async def update_row(request: Request):
 
 
 async def delete_row(request: Request):
-    """DELETE /api/db/{db}/table/{table}/{pk} - Delete a row."""
+    """DELETE /api/db/{db}/table/{table}/{pk} - Delete a row with concurrency control."""
     ctx = _get_ctx(request)
     write_config = _get_write_config(request)
 
@@ -224,6 +242,12 @@ async def delete_row(request: Request):
         return JSONResponse({"error": "Database not found"}, status_code=404)
 
     conn = await ctx.registry.get_connection(db_name)
+
+    # Idempotency check
+    idempotency_key, cached = await _check_idempotency(conn, request, write_config)
+    if cached:
+        return JSONResponse(cached["body"], status_code=cached["status"])
+
     pk_column = await _get_pk_column(conn, table_name)
     if not pk_column:
         return JSONResponse({"error": "Table has no primary key"}, status_code=400)
@@ -251,10 +275,13 @@ async def delete_row(request: Request):
                 row_pk=str(pk_value),
                 before_data=before_row,
                 user_token=token,
+                idempotency_key=idempotency_key,
             )
 
         await conn.commit()
-        return JSONResponse({"status": "deleted", "pk": pk_value})
+        response_body = {"status": "deleted", "pk": pk_value}
+        await _store_idempotent_response(conn, idempotency_key, 200, response_body)
+        return JSONResponse(response_body)
 
     except ConcurrencyConflictError as e:
         return JSONResponse({"error": e.message}, status_code=409)
@@ -264,7 +291,7 @@ async def delete_row(request: Request):
 
 
 async def batch_operations(request: Request):
-    """POST /api/db/{db}/table/{table}/_batch - Transactional batch operations."""
+    """POST /api/db/{db}/table/{table}/_batch - Transactional batch with concurrency control."""
     ctx = _get_ctx(request)
     write_config = _get_write_config(request)
 
@@ -279,13 +306,20 @@ async def batch_operations(request: Request):
     if db_name not in ctx.registry.databases:
         return JSONResponse({"error": "Database not found"}, status_code=404)
 
+    conn = await ctx.registry.get_connection(db_name)
+
+    # Idempotency check for entire batch
+    idempotency_key, cached = await _check_idempotency(conn, request, write_config)
+    if cached:
+        return JSONResponse(cached["body"], status_code=cached["status"])
+
     body = await request.json()
     operations = body.get("operations", [])
     if not operations:
         return JSONResponse({"error": "No operations provided"}, status_code=400)
 
-    conn = await ctx.registry.get_connection(db_name)
     pk_column = await _get_pk_column(conn, table_name)
+    use_version = await has_version_column(conn, table_name)
 
     if write_config.get("audit_log", True):
         await ensure_audit_table(conn)
@@ -298,6 +332,7 @@ async def batch_operations(request: Request):
             op_type = op.get("operation", "").lower()
             data = op.get("data", {})
             pk = op.get("pk")
+            expected_version = op.get("version")  # per-operation concurrency control
 
             try:
                 check_table_permission(db_name, table_name, op_type, write_config)
@@ -321,18 +356,28 @@ async def batch_operations(request: Request):
                     )
 
             elif op_type == "update" and pk and pk_column:
+                # Concurrency check within batch
+                if use_version and expected_version is not None:
+                    await check_version(conn, table_name, pk_column, pk, int(expected_version))
+
                 set_clauses = []
                 values = []
                 for col, val in data.items():
-                    if col == pk_column:
+                    if col == pk_column or col == "_version":
                         continue
                     set_clauses.append(f'"{col}" = ?')
                     values.append(val)
+                if use_version:
+                    set_clauses.append("_version = _version + 1")
+                if not set_clauses:
+                    raise Exception(f"No fields to update for pk={pk}")
                 values.append(pk)
-                await conn.execute(
+                cursor = await conn.execute(
                     f'UPDATE "{table_name}" SET {", ".join(set_clauses)} WHERE "{pk_column}" = ?',
                     values,
                 )
+                if cursor.rowcount == 0:
+                    raise Exception(f"Row not found: pk={pk}")
                 results.append({"operation": "update", "pk": pk})
 
                 if write_config.get("audit_log", True):
@@ -342,9 +387,15 @@ async def batch_operations(request: Request):
                     )
 
             elif op_type == "delete" and pk and pk_column:
-                await conn.execute(
+                # Concurrency check within batch
+                if use_version and expected_version is not None:
+                    await check_version(conn, table_name, pk_column, pk, int(expected_version))
+
+                cursor = await conn.execute(
                     f'DELETE FROM "{table_name}" WHERE "{pk_column}" = ?', (pk,)
                 )
+                if cursor.rowcount == 0:
+                    raise Exception(f"Row not found: pk={pk}")
                 results.append({"operation": "delete", "pk": pk})
 
                 if write_config.get("audit_log", True):
@@ -356,12 +407,13 @@ async def batch_operations(request: Request):
                 raise Exception(f"Invalid operation: {op_type}")
 
         await conn.commit()
-        return JSONResponse({
-            "status": "completed",
-            "results": results,
-            "count": len(results),
-        })
+        response_body = {"status": "completed", "results": results, "count": len(results)}
+        await _store_idempotent_response(conn, idempotency_key, 200, response_body)
+        return JSONResponse(response_body)
 
+    except ConcurrencyConflictError as e:
+        await conn.rollback()
+        return JSONResponse({"error": e.message, "results": results}, status_code=409)
     except Exception as e:
         await conn.rollback()
         return JSONResponse({"error": str(e), "results": results}, status_code=400)

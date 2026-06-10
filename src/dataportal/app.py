@@ -61,7 +61,8 @@ async def _startup(app: Starlette):
     sandbox = SQLSandbox(config.permissions)
     importer = CSVImporter(config.import_config)
     registry = DatabaseRegistry()
-    plugin_manager = PluginManager()
+    plugin_config = config.get("plugins", default={}) or {}
+    plugin_manager = PluginManager(plugin_config=plugin_config)
 
     state_file = Path.home() / ".dataportal" / "plugins.json"
     plugin_manager.set_state_file(state_file)
@@ -85,8 +86,34 @@ async def _startup(app: Starlette):
     # Initialize plugins
     await plugin_manager.initialize_all(ctx)
 
-    # Register plugin-provided Jinja2 global
-    templates.env.globals["plugin_blocks"] = lambda point: ""
+    # Register plugin page routes
+    for route in plugin_manager.get_page_routes():
+        app.routes.insert(-1, route)
+
+    # Register Jinja2 globals for plugin integration
+    def _plugin_blocks_sync(injection_point: str) -> str:
+        """Synchronous wrapper that collects rendered HTML blocks from plugins."""
+        plugins = plugin_manager._html_block_plugins.get(injection_point, [])
+        if not plugins:
+            return ""
+        parts = []
+        for p in plugins:
+            try:
+                import asyncio
+                loop = asyncio.get_event_loop()
+                if loop.is_running():
+                    import concurrent.futures
+                    with concurrent.futures.ThreadPoolExecutor() as pool:
+                        html = pool.submit(asyncio.run, p.render_block(None, {})).result()
+                else:
+                    html = loop.run_until_complete(p.render_block(None, {}))
+                parts.append(html)
+            except Exception:
+                pass
+        return "\n".join(parts)
+
+    from markupsafe import Markup
+    templates.env.globals["plugin_blocks"] = lambda point: Markup(_plugin_blocks_sync(point))
     templates.env.globals["plugin_nav_items"] = plugin_manager.get_nav_items
     templates.env.globals["output_formats"] = plugin_manager.get_output_formats
 
@@ -459,6 +486,64 @@ async def plugins_endpoint(request: Request):
     return JSONResponse({"plugins": ctx.plugin_manager.list_plugins()})
 
 
+async def plugin_manage(request: Request):
+    """POST /plugins/manage - hot-plug management: enable, disable, reload, unload, load."""
+    ctx = _get_ctx(request)
+    body = await request.json()
+    action = body.get("action", "")
+    name = body.get("name", "")
+
+    if not name:
+        return JSONResponse({"error": "Plugin name required"}, status_code=400)
+
+    if action == "enable":
+        await ctx.plugin_manager.enable(name)
+        await ctx.plugin_manager.discover()
+        valid, reasons = await ctx.plugin_manager.validate(name)
+        if valid:
+            instance = await ctx.plugin_manager.load(name)
+            if instance:
+                await ctx.plugin_manager.initialize(name, ctx)
+        info = ctx.plugin_manager.get_plugin_info(name)
+        return JSONResponse({"status": "enabled", "plugin": info})
+
+    elif action == "disable":
+        await ctx.plugin_manager.disable(name)
+        return JSONResponse({"status": "disabled", "plugin": ctx.plugin_manager.get_plugin_info(name)})
+
+    elif action == "reload":
+        success = await ctx.plugin_manager.reload(name, ctx)
+        info = ctx.plugin_manager.get_plugin_info(name)
+        if success:
+            return JSONResponse({"status": "reloaded", "plugin": info})
+        return JSONResponse({"status": "failed", "plugin": info}, status_code=500)
+
+    elif action == "unload":
+        await ctx.plugin_manager.unload(name)
+        return JSONResponse({"status": "unloaded", "plugin": ctx.plugin_manager.get_plugin_info(name)})
+
+    elif action == "load":
+        await ctx.plugin_manager.discover()
+        valid, reasons = await ctx.plugin_manager.validate(name)
+        if not valid:
+            return JSONResponse({"error": f"Validation failed: {reasons}"}, status_code=400)
+        instance = await ctx.plugin_manager.load(name)
+        if not instance:
+            return JSONResponse({"error": "Load failed"}, status_code=500)
+        success = await ctx.plugin_manager.initialize(name, ctx)
+        info = ctx.plugin_manager.get_plugin_info(name)
+        if success:
+            return JSONResponse({"status": "loaded", "plugin": info})
+        return JSONResponse({"status": "failed", "plugin": info}, status_code=500)
+
+    elif action == "health":
+        result = await ctx.plugin_manager.health_check(name)
+        return JSONResponse({"status": "ok", "health": result})
+
+    else:
+        return JSONResponse({"error": f"Unknown action: {action}"}, status_code=400)
+
+
 # --- App factory ---
 
 def create_app() -> Starlette:
@@ -468,6 +553,7 @@ def create_app() -> Starlette:
         Route("/health", health_check),
         Route("/config.json", config_endpoint),
         Route("/plugins.json", plugins_endpoint),
+        Route("/plugins/manage", plugin_manage, methods=["POST"]),
         Route("/db/{db}/table/{table}", browse_table),
         Route("/db/{db}/views", list_views),
         Route("/views/save", save_view, methods=["POST"]),
