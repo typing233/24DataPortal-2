@@ -28,6 +28,26 @@ BASE_DIR = Path(__file__).parent
 templates = Jinja2Templates(directory=str(BASE_DIR / "templates"))
 
 
+def _plugin_blocks_sync(plugin_manager, injection_point: str, request=None, context=None) -> str:
+    """Synchronous wrapper that collects rendered HTML blocks from plugins."""
+    plugins = plugin_manager._html_block_plugins.get(injection_point, [])
+    if not plugins:
+        return ""
+    ctx = context or {}
+    if request:
+        ctx.setdefault("request", request)
+    parts = []
+    for p in plugins:
+        try:
+            import concurrent.futures
+            with concurrent.futures.ThreadPoolExecutor() as pool:
+                html = pool.submit(asyncio.run, p.render_block(request, ctx)).result()
+            parts.append(html)
+        except Exception:
+            pass
+    return "\n".join(parts)
+
+
 def _get_ctx(request: Request) -> AppContext:
     return request.app.state.ctx
 
@@ -85,35 +105,23 @@ async def _startup(app: Starlette):
 
     # Initialize plugins
     await plugin_manager.initialize_all(ctx)
+    plugin_manager.set_app(app)
 
     # Register plugin page routes
     for route in plugin_manager.get_page_routes():
         app.routes.insert(-1, route)
 
     # Register Jinja2 globals for plugin integration
-    def _plugin_blocks_sync(injection_point: str) -> str:
-        """Synchronous wrapper that collects rendered HTML blocks from plugins."""
-        plugins = plugin_manager._html_block_plugins.get(injection_point, [])
-        if not plugins:
-            return ""
-        parts = []
-        for p in plugins:
-            try:
-                import asyncio
-                loop = asyncio.get_event_loop()
-                if loop.is_running():
-                    import concurrent.futures
-                    with concurrent.futures.ThreadPoolExecutor() as pool:
-                        html = pool.submit(asyncio.run, p.render_block(None, {})).result()
-                else:
-                    html = loop.run_until_complete(p.render_block(None, {}))
-                parts.append(html)
-            except Exception:
-                pass
-        return "\n".join(parts)
-
     from markupsafe import Markup
-    templates.env.globals["plugin_blocks"] = lambda point: Markup(_plugin_blocks_sync(point))
+    from jinja2 import pass_context
+
+    @pass_context
+    def _jinja_plugin_blocks(jinja_context, point):
+        req = jinja_context.get("request")
+        tpl_ctx = dict(jinja_context)
+        return Markup(_plugin_blocks_sync(plugin_manager, point, req, tpl_ctx))
+
+    templates.env.globals["plugin_blocks"] = _jinja_plugin_blocks
     templates.env.globals["plugin_nav_items"] = plugin_manager.get_nav_items
     templates.env.globals["output_formats"] = plugin_manager.get_output_formats
 

@@ -1,6 +1,7 @@
 """Write API request handlers with unified idempotency and concurrency control."""
 from __future__ import annotations
 
+import hashlib
 import json
 from typing import Any
 
@@ -40,15 +41,23 @@ async def _get_pk_column(conn, table_name: str) -> str | None:
     return None
 
 
-async def _check_idempotency(conn, request: Request, write_config: dict) -> tuple[str | None, dict | None]:
-    """Check idempotency key. Returns (key, cached_response) or (key, None) if not cached."""
-    idempotency_key = request.headers.get("idempotency-key")
-    if not idempotency_key:
+async def _check_idempotency(conn, request: Request, write_config: dict, body_bytes: bytes = b"") -> tuple[str | None, dict | None]:
+    """Check idempotency key. Returns (scoped_key, cached_response) or (scoped_key, None).
+
+    The stored key is a composite of the header value + request method + path + body hash,
+    so the same idempotency-key header used with different methods/paths/bodies won't collide.
+    """
+    header_key = request.headers.get("idempotency-key")
+    if not header_key:
         return None, None
+
+    body_hash = hashlib.sha256(body_bytes).hexdigest()[:16]
+    scoped_key = f"{header_key}:{request.method}:{request.url.path}:{body_hash}"
+
     await ensure_idempotency_table(conn)
     window = write_config.get("idempotency_window_seconds", 3600)
-    cached = await get_cached_response(conn, idempotency_key, window)
-    return idempotency_key, cached
+    cached = await get_cached_response(conn, scoped_key, window)
+    return scoped_key, cached
 
 
 async def _store_idempotent_response(conn, key: str | None, status: int, body: dict):
@@ -78,11 +87,12 @@ async def create_row(request: Request):
     if db_name not in ctx.registry.databases:
         return JSONResponse({"error": "Database not found"}, status_code=404)
 
-    body = await request.json()
+    body_bytes = await request.body()
+    body = json.loads(body_bytes)
     conn = await ctx.registry.get_connection(db_name)
 
     # Idempotency check
-    idempotency_key, cached = await _check_idempotency(conn, request, write_config)
+    idempotency_key, cached = await _check_idempotency(conn, request, write_config, body_bytes)
     if cached:
         return JSONResponse(cached["body"], status_code=cached["status"])
 
@@ -150,7 +160,8 @@ async def update_row(request: Request):
     conn = await ctx.registry.get_connection(db_name)
 
     # Idempotency check
-    idempotency_key, cached = await _check_idempotency(conn, request, write_config)
+    body_bytes = await request.body()
+    idempotency_key, cached = await _check_idempotency(conn, request, write_config, body_bytes)
     if cached:
         return JSONResponse(cached["body"], status_code=cached["status"])
 
@@ -158,7 +169,7 @@ async def update_row(request: Request):
     if not pk_column:
         return JSONResponse({"error": "Table has no primary key"}, status_code=400)
 
-    body = await request.json()
+    body = json.loads(body_bytes)
 
     # Concurrency control via If-Match header
     if_match = request.headers.get("if-match")
@@ -244,7 +255,8 @@ async def delete_row(request: Request):
     conn = await ctx.registry.get_connection(db_name)
 
     # Idempotency check
-    idempotency_key, cached = await _check_idempotency(conn, request, write_config)
+    body_bytes = await request.body()
+    idempotency_key, cached = await _check_idempotency(conn, request, write_config, body_bytes)
     if cached:
         return JSONResponse(cached["body"], status_code=cached["status"])
 
@@ -309,11 +321,12 @@ async def batch_operations(request: Request):
     conn = await ctx.registry.get_connection(db_name)
 
     # Idempotency check for entire batch
-    idempotency_key, cached = await _check_idempotency(conn, request, write_config)
+    body_bytes = await request.body()
+    idempotency_key, cached = await _check_idempotency(conn, request, write_config, body_bytes)
     if cached:
         return JSONResponse(cached["body"], status_code=cached["status"])
 
-    body = await request.json()
+    body = json.loads(body_bytes)
     operations = body.get("operations", [])
     if not operations:
         return JSONResponse({"error": "No operations provided"}, status_code=400)

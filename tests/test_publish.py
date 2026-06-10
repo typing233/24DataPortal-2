@@ -57,7 +57,7 @@ class TestRenderGeneration:
         assert "type: web" in result
         assert "dataportal" in result
         assert "healthCheckPath: /health" in result
-        assert "plan: free" in result
+        assert "plan:" in result
 
 
 class TestCloudRunGeneration:

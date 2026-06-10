@@ -59,10 +59,15 @@ class PluginManager:
         self._output_plugins: dict[str, OutputPlugin] = {}
         self._html_block_plugins: dict[str, list[HTMLBlockPlugin]] = {}
         self._page_plugins: list[PagePlugin] = []
+        self._page_plugin_routes: dict[str, list] = {}  # name -> route objects
         self._sql_filter_plugins: list[SQLFilterPlugin] = []
         self._disabled: set[str] = set()
         self._state_file: Path | None = None
         self._config: dict = plugin_config or {}
+        self._app = None  # Set after app is created for dynamic route registration
+
+    def set_app(self, app):
+        self._app = app
 
     def set_config(self, config: dict):
         self._config = config
@@ -160,28 +165,84 @@ class PluginManager:
             return False
 
     def _check_dependency_conflicts(self, name: str) -> list[str]:
-        """Check if the plugin's dependencies conflict with core or other plugins."""
+        """Check if the plugin's dependencies conflict with currently installed packages."""
         conflicts = []
         try:
-            from importlib.metadata import distribution, requires
+            from importlib.metadata import distribution, packages_distributions
+            from packaging.requirements import Requirement
+            from packaging.version import Version
+
             dist = distribution(name.replace("-", "_"))
             plugin_reqs = dist.requires or []
 
-            # Get core requirements
-            core_dist = distribution("dataportal")
-            core_reqs = {r.split()[0].split(">")[0].split("<")[0].split("=")[0].split("!")[0].lower()
-                        for r in (core_dist.requires or [])}
-
             for req_str in plugin_reqs:
-                # Parse requirement name
-                req_name = req_str.split()[0].split(">")[0].split("<")[0].split("=")[0].split("!")[0].split(";")[0].lower()
-                # We only flag if plugin requires a package that core also requires
-                # with potentially incompatible versions (simple overlap check)
-                if req_name in core_reqs and "extra ==" not in req_str:
-                    # Both need it - not a conflict per se, just noted for awareness
+                if "extra ==" in req_str:
+                    continue
+                try:
+                    req = Requirement(req_str)
+                except Exception:
+                    continue
+
+                # Check if the required package is installed and satisfies the specifier
+                try:
+                    installed_dist = distribution(req.name)
+                    installed_version = Version(installed_dist.version)
+                    if req.specifier and installed_version not in req.specifier:
+                        conflicts.append(
+                            f"Plugin '{name}' requires {req.name}{req.specifier} "
+                            f"but {installed_version} is installed"
+                        )
+                except Exception:
+                    # Package not installed - will fail at import time
+                    conflicts.append(
+                        f"Plugin '{name}' requires {req.name} which is not installed"
+                    )
+
+            # Check cross-plugin conflicts: if another loaded plugin requires
+            # the same package with an incompatible specifier
+            for other_name, other_entry in self._plugins.items():
+                if other_name == name:
+                    continue
+                if other_entry.state not in (PluginState.INITIALIZED, PluginState.HEALTHY):
+                    continue
+                try:
+                    other_dist = distribution(other_name.replace("-", "_"))
+                    other_reqs = other_dist.requires or []
+                    for other_req_str in other_reqs:
+                        if "extra ==" in other_req_str:
+                            continue
+                        try:
+                            other_req = Requirement(other_req_str)
+                        except Exception:
+                            continue
+                        # Find overlapping requirements
+                        for req_str_inner in plugin_reqs:
+                            if "extra ==" in req_str_inner:
+                                continue
+                            try:
+                                my_req = Requirement(req_str_inner)
+                            except Exception:
+                                continue
+                            if my_req.name.lower() == other_req.name.lower():
+                                # Both require same package - check for version conflict
+                                if my_req.specifier and other_req.specifier:
+                                    try:
+                                        installed_dist = distribution(my_req.name)
+                                        iv = Version(installed_dist.version)
+                                        if iv not in my_req.specifier or iv not in other_req.specifier:
+                                            conflicts.append(
+                                                f"Version conflict on '{my_req.name}': "
+                                                f"'{name}' needs {my_req.specifier}, "
+                                                f"'{other_name}' needs {other_req.specifier}, "
+                                                f"installed: {iv}"
+                                            )
+                                    except Exception:
+                                        pass
+                except Exception:
                     pass
+
         except Exception:
-            pass  # If we can't check, allow loading
+            pass
         return conflicts
 
     async def load(self, name: str) -> BasePlugin | None:
@@ -316,6 +377,11 @@ class PluginManager:
             self._html_block_plugins.setdefault(point, []).append(plugin)
         if isinstance(plugin, PagePlugin):
             self._page_plugins.append(plugin)
+            routes = plugin.get_routes()
+            self._page_plugin_routes[name] = routes
+            if self._app and routes:
+                for route in routes:
+                    self._app.routes.insert(-1, route)
         if isinstance(plugin, SQLFilterPlugin):
             self._sql_filter_plugins.append(plugin)
 
@@ -329,6 +395,12 @@ class PluginManager:
             self._html_block_plugins[point] = [p for p in plugins if p is not plugin]
         if isinstance(plugin, PagePlugin):
             self._page_plugins = [p for p in self._page_plugins if p is not plugin]
+            routes = self._page_plugin_routes.pop(name, [])
+            if self._app and routes:
+                route_ids = set(id(r) for r in routes)
+                to_remove = [r for r in self._app.routes if id(r) in route_ids]
+                for r in to_remove:
+                    self._app.routes.remove(r)
         if isinstance(plugin, SQLFilterPlugin):
             self._sql_filter_plugins = [p for p in self._sql_filter_plugins if p is not plugin]
 

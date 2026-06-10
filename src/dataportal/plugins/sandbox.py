@@ -46,6 +46,15 @@ RESTRICTED_OS_ATTRS = frozenset([
     "rmdir",
 ])
 
+# Core packages that plugins must not shadow or replace
+PROTECTED_PACKAGES = frozenset([
+    "starlette",
+    "jinja2",
+    "markupsafe",
+    "aiosqlite",
+    "dataportal",
+])
+
 
 class PluginImportBlocker:
     """Meta path finder that blocks dangerous imports for sandboxed plugins."""
@@ -92,18 +101,45 @@ class PluginImportBlocker:
         )
 
 
+class PluginModuleIsolator:
+    """Prevents plugins from replacing core modules already in sys.modules.
+
+    When active, captures what modules exist before plugin code runs.
+    After plugin code completes, any new modules the plugin loaded stay, but
+    if the plugin somehow replaced a protected module, it gets restored.
+    """
+
+    def __init__(self):
+        self._snapshot: dict[str, Any] = {}
+
+    def capture(self):
+        self._snapshot = {
+            name: mod for name, mod in sys.modules.items()
+            if any(name == p or name.startswith(p + ".") for p in PROTECTED_PACKAGES)
+        }
+
+    def restore(self):
+        for name, mod in self._snapshot.items():
+            if sys.modules.get(name) is not mod:
+                sys.modules[name] = mod
+        self._snapshot = {}
+
+
 class SandboxContext:
     """Context manager that activates import blocking during plugin execution."""
 
     def __init__(self, permissions: list[str] | None = None):
         self._blocker = PluginImportBlocker(permissions)
+        self._isolator = PluginModuleIsolator()
 
     def __enter__(self):
+        self._isolator.capture()
         self._blocker.activate()
         return self
 
     def __exit__(self, *args):
         self._blocker.deactivate()
+        self._isolator.restore()
 
 
 def run_sandboxed(func, *args, permissions: list[str] | None = None, **kwargs):
